@@ -1,0 +1,260 @@
+# L1 ground truth — everything mounted directly on the root FastAPI app
+# (finbot/main.py) rather than a sub-app: magic-link auth (finbot/apps/finbot/auth.py,
+# prefix /auth), marketing/landing pages (finbot/apps/finbot/routes.py, root
+# prefix), the hidden CineFlow demo tenant (finbot/apps/web/routes.py,
+# mounted at /demo/cineflow), and a handful of routes defined inline in
+# main.py itself.
+
+# --- Magic-link authentication (finbot/apps/finbot/auth.py, prefix /auth) ---
+
+- id: platform.auth.request_magic_link
+  component: platform
+  direction: [entry, exit]
+  interaction_type: http_route
+  method: POST
+  path: /auth/magic-link
+  parameters: [{name: email, location: body, type: "form field (Form(...))", required: true}]
+  auth_requirement: "none required to call it; a no-op redirect if already authenticated"
+  authz_check_location: in_handler
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/auth.py:27-81"}
+  notes: >
+    Genuine exit point (sends a real email via get_email_service — console
+    in dev, Resend in prod) accepting ANY string as `email` with only
+    `.lower().strip()` normalization visible — no format validation at this
+    layer. token = secrets.token_urlsafe(32), stored with a
+    MAGIC_LINK_EXPIRY_MINUTES TTL. Worth checking black-box whether
+    repeated calls are rate-limited (not tested in this pass) since this is
+    an unauthenticated mail-send primitive, i.e. a potential spam/abuse
+    vector independent of any CTF challenge.
+
+- id: platform.auth.verify_magic_link
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /auth/verify
+  parameters: [{name: token, location: query, type: string, required: true}]
+  auth_requirement: "none"
+  authz_check_location: in_handler
+  authz_check_detail: >
+    token looked up by exact match, checked via magic_token.is_valid()
+    (not independently read in this pass — presumably expiry + used_at
+    checks), then marks used_at and upgrades a session to permanent bound
+    to magic_token.email.
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/auth.py:84-198"}
+  notes: >
+    Session-fixation-shaped logic worth flagging for a closer read, not
+    confirmed exploitable here: the handler explicitly reasons about "which
+    session to upgrade" (current browser's vs. the one stored in the token)
+    with an inline comment about avoiding two browsers sharing one session
+    ID — i.e. the authors were already aware of and defending against a
+    specific session-fixation variant. Ground truth should record that the
+    defense exists (prefer current_session over magic_token.session_id) and
+    treat full verification of its correctness as a dedicated follow-up,
+    not assume it's sound just because a comment says so.
+
+- id: platform.auth.logout
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /auth/logout
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/auth.py:201-229"}
+  notes: "GET-triggered state change (deletes session, issues new temporary one) — CSRF-shaped concern in general for GET-as-logout patterns, though the worst case here is just forcing a logout, not a privileged action."
+
+- id: platform.auth.check_email_page
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /auth/check-email
+  parameters: [{name: email, location: query, type: string, required: false, source: "default ''"}]
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/auth.py:232-242"}
+  notes: "email query param is reflected into the confirmation page — check for unescaped reflection (XSS) in a follow-up pass; not tested black-box here."
+
+# --- Marketing / landing pages (finbot/apps/finbot/routes.py, root prefix) ---
+
+- id: platform.web.home
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: "confirmed live: 200"}
+  visibility: black_box_observable
+  evidence: {black_box: "curl / -> 200", source_ref: "finbot/apps/finbot/routes.py:13-16"}
+
+- id: platform.web.portals
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /portals
+  ui_trigger: "'Enter the Platform' / nav CTA — the hub linking to Vendor/Admin/CTF portals"
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/routes.py:19-22"}
+
+- id: platform.web.how_it_works
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /how-it-works
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/routes.py:25-28"}
+
+- id: platform.web.about
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /about
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/routes.py:31-34"}
+
+- id: platform.web.stats
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /stats
+  auth_requirement: "none"
+  state_preconditions: ["settings.CC_PUBLIC_STATS_ENABLED (renders a coming_soon placeholder when false, rather than being unreachable — different pattern from CC_ANALYTICS_ENABLED elsewhere, which un-mounts routes entirely)"]
+  reachability: {status: black_box_reachable, notes: "always reachable; content varies by flag"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/routes.py:37-60"}
+
+- id: platform.api.pulse
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /api/pulse
+  auth_requirement: "none"
+  state_preconditions: ["CC_PUBLIC_STATS_ENABLED"]
+  reachability: {status: black_box_reachable, notes: "returns {enabled: false} rather than 404/blocked when flag is off — content-based gating, not route-based"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/routes.py:63-85"}
+
+- id: platform.web.test_error_pages
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: "/test/404, /test/403, /test/400, /test/500, /test/503, /api/test/404, /api/test/500"
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: "seven distinct routes, grouped as one record since they're mechanically identical (raise HTTPException(status_code=N))"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/finbot/routes.py:89-129"}
+  notes: >
+    Explicitly labeled "for development/testing" in source but has NO
+    settings.DEBUG guard and is mounted unconditionally on the production
+    root router — confirmed still present in the file as shipped. Low
+    individual severity (just triggers styled error pages / raises a
+    generic HTTPException with a static detail string — no information
+    disclosure beyond what any 404/500 would show), but it's dead weight
+    on the production attack surface that a min-effort black-box crawl
+    will trip over immediately, and worth a one-line fix (gate behind
+    settings.DEBUG) regardless of exploitability.
+
+# --- CineFlow demo tenant (finbot/apps/web/routes.py, mounted /demo/cineflow) ---
+
+- id: platform.demo.cineflow_pages
+  component: web
+  interaction_type: http_route
+  method: GET
+  path: "/demo/cineflow/, /about, /work, /partners, /careers, /contact"
+  auth_requirement: "none"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: "confirmed live: GET /demo/cineflow/ -> 200; grouped as one record, six near-identical static-template routes"}
+  visibility: grey_box_required
+  evidence: {black_box: "curl /demo/cineflow/ -> 200", source_ref: "finbot/apps/web/routes.py; finbot/main.py:178"}
+  notes: >
+    finbot/main.py:177 comment: "CineFlow demo tenant (hidden, preserved
+    for future IPI scenarios)". Textbook case of the visibility/reachability
+    split this ground-truth schema exists to capture: NOT linked from
+    /portals or any nav discovered during black-box navigation of the rest
+    of the platform (visibility: grey_box_required — findable by directory
+    guessing/brute force, or trivially by reading main.py white-box), while
+    black-box reachability is 200 OK the moment the path is known, no auth,
+    no gating. "IPI" = indirect prompt injection; currently inert (a
+    fictional media-company marketing site with no forms or agent
+    integration visible in routes.py), i.e. a future/placeholder attack
+    surface rather than a currently exploitable one — ground truth should
+    record it as present-but-dormant, not as a live finding.
+
+# --- Inline routes on the root app (finbot/main.py) ---
+
+- id: platform.web.agreement
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /agreement
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: "confirmed live: 200"}
+  visibility: black_box_observable
+  evidence: {black_box: "curl /agreement -> 200", source_ref: "finbot/main.py:182-191"}
+  notes: "Serves a static HTML file straight off disk on every request (explicit '(TODO) cache this' comment) — availability/perf note, not a security finding."
+
+- id: platform.api.log_agreement
+  component: platform
+  interaction_type: http_route
+  method: POST
+  path: /api/log-agreement
+  parameters: [{name: body, location: body, type: "raw JSON dict", required: true, source: "userAgent, referrer"}]
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/main.py:195-212"}
+  notes: "await request.json() with no Pydantic model — unvalidated arbitrary-shape body, only userAgent/referrer read out via .get(). Purely an audit-log write (emits platform.agreement_accepted); low-value target but worth noting as the one route on the whole platform parsing raw JSON instead of a typed model."
+
+- id: platform.api.healthz
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /healthz
+  auth_requirement: "none"
+  reachability: {status: black_box_reachable, notes: "confirmed live: 200"}
+  visibility: black_box_observable
+  evidence: {black_box: "curl /healthz -> 200 {\"status\":\"ok\"}", source_ref: "finbot/main.py:215-218"}
+  notes: "The ACTUAL liveness probe for load balancers, distinct from and reachable where cc.api.health (behind maintainer auth) is not — sensible split, worth recording explicitly since a black-box tester could otherwise wrongly conclude the platform has no working health endpoint after hitting the 403 on /cc/health."
+
+- id: platform.api.session_status
+  component: platform
+  interaction_type: http_route
+  method: GET
+  path: /api/session/status
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: "confirmed live: 200, see vendor_portal ground truth file header for a full sample response"}
+  visibility: black_box_observable
+  evidence: {black_box: "curl -> 200 {session_id, user_id, is_temporary, namespace, security_status, csrf_token}", source_ref: "finbot/main.py:221-234"}
+  notes: >
+    THE endpoint that hands out the CSRF token needed for every other
+    state-changing request catalogued across this entire ground truth —
+    functionally a prerequisite `state_precondition` for every "CSRF token
+    header present" entry elsewhere, recorded once here rather than
+    threaded as a dependency edge through 60+ individual records. Also
+    discloses namespace and a truncated session_id/user_id — namespace in
+    particular is a meaningful recon value (it's the isolation boundary
+    this entire multi-tenant platform relies on) handed out to any caller
+    with zero authentication.
+
+- id: platform.websocket
+  component: platform
+  interaction_type: websocket
+  method: WS
+  path: "not enumerated in this pass — finbot/core/websocket/websocket_router mounted via app.include_router at finbot/main.py:172, actual path(s) not read"
+  auth_requirement: "unknown — not verified in this pass"
+  reachability: {status: black_box_reachable, notes: "README lists 'Real-time scoring via WebSocket notifications' as a shipped feature; SessionMiddleware explicitly special-cases 'upgrade: websocket' requests to skip its own session logic (finbot/core/auth/middleware.py:27-29), meaning WS connections may bypass the session-cookie machinery entirely -- flagged as an open item requiring a dedicated read of finbot/core/websocket/ before this record can be considered complete"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/main.py:172; finbot/core/auth/middleware.py:27-29"}
+  notes: "Explicitly incomplete record — placeholder for a follow-up pass rather than a confirmed-empty finding. Do not treat the 'unknown' auth_requirement as 'no auth'; it means 'not yet checked.'"

@@ -1,0 +1,190 @@
+# L1 ground truth — Vendor Portal web (HTML) routes
+# Source: finbot/apps/vendor/routes/web.py, mounted at /vendor via
+# finbot/main.py:161 (app.mount("/vendor", vendor_app))
+# All routes share: SessionMiddleware (finbot/core/auth/middleware.py) creates
+# an anonymous session cookie on first hit to ANY path under /vendor
+# (load_vendor_context=True), so none of these require prior "login" in the
+# credential sense — auth_requirement below reflects that directly.
+
+- id: vendor.web.home
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/
+  ui_trigger: "root of vendor portal nav; also the /vendor -> /vendor/ 307 redirect target"
+  parameters: []
+  auth_requirement: "session:temporary (anonymous session auto-created)"
+  authz_check_location: in_handler
+  authz_check_detail: >
+    Pure routing dispatcher — redirects to onboarding / select-vendor /
+    dashboard based on vendor_repo.get_vendor_count() and
+    session_context.requires_vendor_selection(). No access-control decision.
+  state_preconditions: []
+  reachability: {status: black_box_reachable, notes: "confirmed live: GET /vendor -> 307 -> /vendor/ -> 302 -> /vendor/onboarding for a fresh session"}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence:
+    black_box: "curl: GET /vendor -> 307; GET /vendor/ -> 302 Location: /vendor/onboarding"
+    source_ref: "finbot/apps/vendor/routes/web.py:19-35"
+  notes: ""
+
+- id: vendor.web.onboarding
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/onboarding
+  ui_trigger: "onboarding form page, default landing page for a brand-new session"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  state_preconditions: []
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence:
+    black_box: "curl: GET /vendor/onboarding -> 200"
+    source_ref: "finbot/apps/vendor/routes/web.py:38-53"
+  notes: "Renders onboarding.html with namespace/user_id in context — the actual POST that submits the form is vendor.api.vendors.register in l1_api.yaml."
+
+- id: vendor.web.select_vendor
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/select-vendor
+  ui_trigger: "shown automatically for multi-vendor sessions; ?force=true bypasses the has_vendor_context() redirect"
+  parameters:
+    - {name: force, location: query, type: string, required: false, source: "raw query_params.get"}
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  authz_check_detail: "redirects to /vendor/dashboard unless force=true or no vendor context yet"
+  state_preconditions: []
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence:
+    source_ref: "finbot/apps/vendor/routes/web.py:56-73"
+  notes: "?force=true is a white-box-discoverable bypass param not exposed as a visible UI control in the normal flow — grey-box (source or JS bundle reading) to find, black-box-trivial to use once known."
+
+- id: vendor.web.dashboard
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/dashboard
+  ui_trigger: "main nav 'Dashboard'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  authz_check_detail: "redirects to /vendor/select-vendor if !session_context.has_vendor_context()"
+  state_preconditions: ["vendor context selected (current_vendor_id set)"]
+  reachability: {status: black_box_reachable, notes: "reachable only after at least one vendor exists in this session's namespace"}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence:
+    source_ref: "finbot/apps/vendor/routes/web.py:76-94"
+  notes: ""
+
+- id: vendor.web.invoices
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/invoices
+  ui_trigger: "main nav 'Invoices'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  state_preconditions: ["vendor context selected"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence: {source_ref: "finbot/apps/vendor/routes/web.py:97-113"}
+  notes: "Page shell only; data comes from vendor.api.invoices.list (client-side fetch)."
+
+- id: vendor.web.payments
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/payments
+  ui_trigger: "main nav 'Payments'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  state_preconditions: ["vendor context selected"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence: {source_ref: "finbot/apps/vendor/routes/web.py:116-132"}
+  notes: ""
+
+- id: vendor.web.messages
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/messages
+  ui_trigger: "main nav 'Messages'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  state_preconditions: ["vendor context selected"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence: {source_ref: "finbot/apps/vendor/routes/web.py:135-151"}
+  notes: ""
+
+- id: vendor.web.findrive
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/findrive
+  ui_trigger: "main nav 'FinDrive'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  state_preconditions: ["vendor context selected"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence: {source_ref: "finbot/apps/vendor/routes/web.py:154-170"}
+  notes: ""
+
+- id: vendor.web.profile
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/profile
+  ui_trigger: "main nav 'Profile'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  state_preconditions: ["vendor context selected"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence: {source_ref: "finbot/apps/vendor/routes/web.py:173-189"}
+  notes: ""
+
+- id: vendor.web.assistant
+  component: vendor
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /vendor/assistant
+  ui_trigger: "main nav 'AI Assistant'"
+  parameters: []
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  state_preconditions: ["vendor context selected"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  controls_observed: {csrf: n/a_get, rate_limited: unknown, security_headers: true}
+  evidence: {source_ref: "finbot/apps/vendor/routes/web.py:192-208"}
+  notes: "Chat page shell; the actual chat interaction is vendor.api.chat.send (SSE) in l1_api.yaml — this is the highest-value page for L2 semantic operations since every message is natural-language input to an LLM agent with real tool access."

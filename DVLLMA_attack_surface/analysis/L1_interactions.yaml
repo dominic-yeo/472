@@ -1,0 +1,281 @@
+# L1 — Interaction-level attack surface for Damn Vulnerable LLM Agent (DVLA)
+# Schema: ../schema/L1_schema.yaml
+#
+# Scope: single Streamlit application (main.py) mounted at http://localhost:8501/.
+# There is exactly one HTML surface (the Streamlit SPA shell), one WebSocket
+# (/_stcore/stream) that carries ALL client<->server interaction (widget state
+# changes, including every chat message), and two LangChain tools the agent may
+# invoke. Unlike the FinBot reference app this schema was validated against,
+# there is no separate REST/FastAPI layer and no distinct per-operation HTTP
+# routes: every "operation" in L2 is realized through the single WebSocket
+# entry, disambiguated only by the natural-language content of the chat turn.
+
+records:
+
+  - id: web.http.spa_shell
+    component: web
+    direction: entry
+    interaction_type: http_route
+    method: GET
+    path: "/* (SPA catch-all; also served at /healthz, /vendor.json, /robots.txt,
+      /stream, /docs, /openapi.json, /component-stub, /_stcore/allowed-message-origins
+      and any other unrecognized path)"
+    ui_trigger: "initial browser navigation to http://localhost:8501/"
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability:
+      status: black_box_reachable
+      notes: "curl -> HTTP 200 for every path probed, identical ~7.4KB index.html
+        body for all of them. Confirms this is a client-side-routed SPA with a
+        server-side catch-all, NOT a set of distinct backend routes -- the
+        path names that look like real endpoints (/docs, /openapi.json,
+        /healthz) are red herrings for a tester expecting a FastAPI backend."
+    visibility: black_box_observable
+    controls_observed:
+      csrf: not_applicable_get_only
+      rate_limited: false
+      security_headers: "none observed -- no Content-Security-Policy,
+        X-Frame-Options, X-Content-Type-Options, Strict-Transport-Security,
+        Referrer-Policy, or Permissions-Policy on the GET / response. No
+        Set-Cookie either (no session cookie issued over plain HTTP)."
+    evidence:
+      black_box: "curl -s -D - http://localhost:8501/ -> 200 OK, server: uvicorn,
+        content-length 7459, no security headers, no Set-Cookie; repeated for
+        /healthz, /vendor.json, /robots.txt, /stream, /docs, /openapi.json,
+        /_stcore/allowed-message-origins, /component-stub -- all 200 with the
+        same content-type text/html and (by inspection) the same body."
+      source_ref: null
+    notes: "Served by Streamlit's Starlette/uvicorn ASGI server (this is the
+      post-Tornado, post-1.4x Streamlit architecture -- streamlit==1.63.0 in
+      the project venv). No application code of main.py runs for this
+      request; it is pure static-shell delivery."
+
+  - id: web.http.health
+    component: web
+    direction: entry
+    interaction_type: http_route
+    method: GET
+    path: /_stcore/health
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability:
+      status: black_box_reachable
+      notes: "Only genuinely distinct backend route found besides /static/*.
+        Also referenced by the project's own Dockerfile HEALTHCHECK."
+    visibility: black_box_observable
+    controls_observed:
+      csrf: not_applicable
+      rate_limited: false
+      security_headers: none
+    evidence:
+      black_box: "curl -> 200, body 'ok', content-type text/plain."
+      source_ref: null
+    notes: "Liveness probe; no information disclosure beyond process-up status."
+
+  - id: web.http.static_assets
+    component: web
+    direction: entry
+    interaction_type: static_asset
+    method: GET
+    path: /static/*
+    ui_trigger: "implicit -- loaded by the index.html <script>/<link> tags on
+      every page load (JS bundle, fonts, css, favicon)"
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability:
+      status: black_box_reachable
+      notes: "GET /static/ -> 301 to /static; content-hashed filenames
+        (e.g. index.ByR4Z2EF.js) observed in index.html <script> tags."
+    visibility: black_box_observable
+    controls_observed:
+      csrf: not_applicable
+      rate_limited: false
+      security_headers: none
+    evidence:
+      black_box: "curl -I /static/ -> 301 Moved Permanently, location: /static."
+      source_ref: null
+    notes: "Vendored Streamlit frontend build, not application-specific.
+      labs-logo.png and dvla-demo.gif (used by utils.display_logo /
+      README) are NOT served over HTTP -- they are read from local disk and
+      base64-inlined into the page by Python (utils.py:49-71), so they are not
+      a separate network-reachable asset despite living in the repo root."
+
+  - id: web.ws.stream
+    component: web
+    direction: bidirectional
+    interaction_type: websocket
+    method: TOOL_CALL
+    path: /_stcore/stream
+    ui_trigger: "every widget interaction on the page: the chat_input box
+      (primary attacker-controlled surface), the sidebar 'Show database
+      schema' button, and Streamlit's own internal session-lifecycle messages"
+    parameters:
+      - name: client_state.widget_states (chat_input widget)
+        location: body
+        type: "protobuf WidgetStates -> StringTriggerValue (free-form UTF-8
+          text, effectively unbounded aside from the transport-level
+          max_client_msg_size guard)"
+        required: true
+        source: "BackMsg protobuf (streamlit.proto.BackMsg_pb2)"
+      - name: client_state.widget_states (schema-button widget)
+        location: body
+        type: protobuf WidgetStates -> TriggerValue (bool)
+        required: false
+        source: BackMsg protobuf
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions:
+      - "a Streamlit session must be established first (handshake -> HTTP 101
+        -> runtime.connect_session()); no login step exists anywhere in the app"
+    reachability:
+      status: black_box_reachable
+      notes: "This is the single most important entry point in the app: every
+        user-supplied chat message, including every prompt-injection and SQLi
+        payload below, is delivered exclusively through this channel as a
+        chat_input widget-state update."
+    visibility: black_box_observable
+    controls_observed:
+      csrf: "partial -- server-side Origin/Host validation exists
+        (starlette_websocket.py:_is_origin_allowed) and rejects a WS handshake
+        whose Origin header doesn't match Host and isn't on an allow-list, BUT
+        a request with NO Origin header at all is explicitly allowed by
+        design ('non-browser clients may not [send Origin]... allowed by
+        default' -- starlette_websocket.py:174-178). A same-origin check is
+        not a substitute for authentication here since there is no
+        authenticated identity to protect in the first place."
+      rate_limited: false
+      security_headers: "handshake response carries only Upgrade/Connection/
+        Sec-WebSocket-Accept/Date/Server -- no additional hardening headers"
+    evidence:
+      black_box: "Scripted (non-browser) WebSocket client using the
+        websocket-client library and Streamlit's own compiled protobufs
+        (streamlit.proto.BackMsg_pb2/ForwardMsg_pb2, matching the running
+        streamlit==1.63.0). Sending a request without a custom Origin header
+        completes the HTTP 101 handshake; sending one WITH an explicit Origin
+        header (duplicating the library's own auto-generated Origin) is
+        rejected 400 'invalid Origin header: multiple values', confirming the
+        server actively parses/validates this header rather than ignoring it.
+        However, after a clean 101 handshake, zero ForwardMsg frames were
+        observed over a 45s window with no BackMsg sent -- i.e. a bare
+        scripted client that doesn't replicate the browser's exact
+        post-handshake sequence (subprotocol negotiation / initial
+        client_state) never receives the server's new_session payload. Root
+        cause not fully isolated within this engagement's time budget; the
+        equivalent request/response behavior for actual chat payloads was
+        instead verified with dispositive evidence by driving the identical
+        in-process code path (LangChain AgentExecutor + tools.py +
+        transaction_db.py that main.py wires to this exact socket) against
+        the same live local Ollama backend -- see L2 records for those
+        transcripts. This is grey-box-adjacent evidence, not a literal
+        capture of bytes on port 8501, and is flagged as such."
+      source_ref: "env/Lib/site-packages/streamlit/web/server/starlette/starlette_websocket.py:148-189,432-457
+        (Origin/Host validation); main.py:60-84 (this is the code that runs
+        server-side in response to a chat_input state change delivered over
+        this socket)"
+    notes: "There is no per-operation HTTP route to individually rate-limit,
+      WAF-filter, or API-gateway in front of -- a single always-open,
+      unauthenticated, bidirectional channel carries 100% of the attack
+      surface described in L2. Any control that isn't implemented inside
+      main.py/tools.py itself does not exist."
+
+  - id: agent.tool.get_current_user
+    component: web
+    direction: exit
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: "GetCurrentUser (LangChain Tool name)"
+    ui_trigger: null
+    parameters:
+      - name: input
+        location: body
+        type: string
+        required: false
+        source: "LLM-generated tool_input (LangChain Tool)"
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions:
+      - "LLM must choose to emit a GetCurrentUser action during its ReAct loop
+        -- nothing forces this to happen before GetUserTransactions"
+    reachability:
+      status: black_box_reachable
+      notes: "Reliably invoked on a plain 'what are my transactions' prompt in
+        the baseline run (see L2 chat.query_own_transactions)."
+    visibility: white_box_required
+    controls_observed:
+      csrf: not_applicable
+      rate_limited: false
+      security_headers: not_applicable
+    evidence:
+      black_box: "Agent transcript: tool always returns
+        [{\"userId\": 1, \"username\": \"MartyMcFly\"}] regardless of what
+        (if anything) is passed as input."
+      source_ref: "tools.py:16-26"
+    notes: "The `input` parameter accepted by the Tool wrapper is completely
+      ignored by get_current_user() (tools.py:16-20), which hardcodes
+      db.get_user(1). This is only confirmed by reading the source -- a purely
+      black-box tester would only ever observe 'it always returns user 1',
+      not know WHY (could be a real session lookup that happens to resolve to
+      user 1, or a hardcoded constant -- these have very different security
+      implications and only the source distinguishes them)."
+
+  - id: agent.tool.get_user_transactions
+    component: web
+    direction: exit
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: "GetUserTransactions (LangChain Tool name)"
+    ui_trigger: null
+    parameters:
+      - name: userId
+        location: body
+        type: string
+        required: true
+        source: "LLM-generated tool_input (LangChain Tool) -- free text,
+          no schema, no type coercion, no allow-list, concatenated directly
+          into a SQL string (transaction_db.py:62)"
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions:
+      - "none enforced -- specifically, nothing checks that this userId
+        matches the value most recently returned by GetCurrentUser"
+    reachability:
+      status: black_box_reachable
+      notes: "This is the SQL injection sink. Confirmed end-to-end (see
+        L2 chat.union_sqli_password_exfil)."
+    visibility: black_box_observable
+    controls_observed:
+      csrf: not_applicable
+      rate_limited: false
+      security_headers: not_applicable
+    evidence:
+      black_box: "Live agent transcript: input
+        \"a' UNION SELECT 1,username,password,'','100' FROM Users--\"
+        returns all 4 seeded users' username/password pairs reshaped as
+        fake transaction rows."
+      source_ref: "tools.py:28-44; transaction_db.py:60-72"
+    notes: "The Tool's own `description` string (tools.py:43, the text that is
+      injected into the LLM's prompt on every turn per LangChain's
+      ConversationalChatAgent) literally states the unparameterized query
+      shape: '...running this query: SELECT * FROM Transactions WHERE userId
+      = provided_userId.' This turns the tool description itself into a
+      black-box-discoverable attack blueprint (an attacker can get an LLM to
+      recite its own tool descriptions), independent of ever reading
+      transaction_db.py."
+
+removed_or_not_applicable_from_baseline:
+  - item: "REST/FastAPI-style per-operation routes (finbot-style /vendor/api/v1/...)"
+    reason: "DVLA has no such layer. Every business operation is realized
+      through web.ws.stream + the two agent_tool_call records above; see
+      L2_operations.yaml for the operation-level breakdown this schema
+      expects in place of a route-per-operation catalog."
+  - item: "MCP tool endpoints in the strict protocol sense"
+    reason: "Tools are in-process LangChain Tool objects (tools.py), not
+      externally-hosted MCP servers -- interaction_type: agent_tool_call is
+      used per the L1 schema's own guidance for this case, not mcp_tool."

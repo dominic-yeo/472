@@ -1,0 +1,313 @@
+# L1 ground truth — Command Center (finbot/apps/cc), mounted at /cc
+#
+# The ONE genuinely access-gated subsystem on this platform. Every route is
+# wrapped by app-wide middleware (finbot/apps/cc/main.py:28-34,
+# enforce_cc_auth -> cc_auth_guard in finbot/apps/cc/auth.py:76-87):
+#   1. Requires a PERSISTENT session with a bound, non-null email
+#      (session:temporary is rejected outright — no magic-link, no access)
+#   2. That email must be_active in the `platform_admins` DB table, seeded
+#      once at startup from CC_ALLOWED_EMAILS (env var), with the DB as
+#      source of truth thereafter (env is bootstrap-only; DB can revoke
+#      even an env-listed email via is_active=False)
+# Confirmed live: fresh anonymous session -> GET /cc/ -> HTTP 403 with a
+# branded "Access Denied" HTML page, before even reaching a specific route
+# handler. This is app-wide middleware, not per-route dependencies, so
+# reachability is uniform across every item below — recorded once here
+# rather than repeated 24 times.
+#
+# CAVEAT: none of these were probed authenticated in this pass (doing so
+# would require a real CC_ALLOWED_EMAILS-listed account, which this
+# black-box pass does not have). All entries below are white-box-derived
+# from finbot/apps/cc/routes/*.py; the 403 boundary itself is black-box
+# confirmed, the authenticated behavior behind it is not.
+
+- id: cc.access_boundary
+  component: cc
+  interaction_type: http_route
+  method: "*"
+  path: "/cc/*"
+  auth_requirement: "session:persistent AND role:cc-operator (email in platform_admins, is_active=true)"
+  authz_check_location: middleware
+  authz_check_detail: "finbot/apps/cc/main.py:28-34 app-wide @app.middleware('http'); applies before any router/dependency runs"
+  reachability: {status: blocked_by_control, notes: "confirmed live: fresh session -> 403 on every /cc/* path tried (/cc/, implies all children)"}
+  visibility: black_box_observable
+  evidence: {black_box: "curl fresh cookies -> GET /cc/ -> HTTP 403 branded Access Denied page", source_ref: "finbot/apps/cc/main.py:28-34; finbot/apps/cc/auth.py:76-100"}
+  notes: >
+    Recorded as one boundary record rather than duplicated per child route,
+    since the gate is uniform and app-wide, unlike every other subsystem in
+    this ground truth where authz is per-route (or absent).
+
+- id: cc.web.dashboard
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/
+  reachability: {status: blocked_by_control, notes: "see cc.access_boundary"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/dashboard.py:54"}
+
+- id: cc.web.access_list
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/access/
+  reachability: {status: blocked_by_control, notes: "see cc.access_boundary"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/access.py:16-39"}
+
+- id: cc.api.access.add
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/access/add
+  parameters: [{name: email, location: body, type: "form field", required: true}]
+  reachability: {status: blocked_by_control, notes: "see cc.access_boundary"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/access.py:42-64"}
+  notes: >
+    Grants CC access to an arbitrary email (upserts platform_admins,
+    is_active=true) — privilege-escalation-shaped operation, correctly
+    behind the one real gate on the platform. No CSRF dependency visible
+    at this specific handler beyond whatever the platform-wide CSRF
+    middleware enforces generally.
+
+- id: cc.api.access.toggle
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/access/toggle/{admin_id}
+  parameters: [{name: admin_id, location: path, type: int, required: true}]
+  reachability: {status: blocked_by_control, notes: "see cc.access_boundary"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/access.py:67-79"}
+
+- id: cc.api.health
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/health/
+  reachability: {status: blocked_by_control, notes: "even the health probe requires maintainer auth — a monitoring/availability-tooling friction point, not itself a vulnerability"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/health.py:13"}
+
+- id: cc.web.analytics
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/
+  state_preconditions: ["settings.CC_ANALYTICS_ENABLED (router only mounted when this flag is set, finbot/apps/cc/main.py:45-48)"]
+  reachability: {status: conditionally_mounted, notes: "gated by BOTH cc.access_boundary and CC_ANALYTICS_ENABLED — two independent conditions must hold"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:75-107"}
+
+- id: cc.web.analytics_pages
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/pages
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:109-128"}
+
+- id: cc.api.analytics.daily
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/api/daily
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:130-139"}
+
+- id: cc.api.analytics.daily_latency
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/api/daily-latency
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:141-150"}
+
+- id: cc.web.analytics_ctf
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/ctf
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:152-181"}
+
+- id: cc.api.analytics.daily_events
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/api/daily-events
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:183-192"}
+
+- id: cc.api.analytics.daily_completions
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/api/daily-completions
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:194-203"}
+
+- id: cc.web.analytics_threat_intel
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/threat-intel
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:205-226"}
+  notes: >
+    "Threat intel" + "daily-probes" + "daily-bot-traffic" (siblings below)
+    imply this platform fingerprints/logs scanning and bot behavior against
+    itself — a meta attack-surface-analysis capability worth a closer read
+    in a later pass (which requests get flagged as "probes," from what
+    signal).
+
+- id: cc.api.analytics.daily_probes
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/api/daily-probes
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:228-237"}
+
+- id: cc.api.analytics.daily_bot_traffic
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/analytics/api/daily-bot-traffic
+  state_preconditions: ["CC_ANALYTICS_ENABLED"]
+  reachability: {status: conditionally_mounted, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/analytics.py:239-248"}
+
+- id: cc.web.audit
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/audit/
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/audit.py:106"}
+
+- id: cc.web.challenges
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/challenges/
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/challenges.py:117-153"}
+
+- id: cc.api.challenges.toggle
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/challenges/api/toggle
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/challenges.py:154+"}
+  notes: "Platform-wide challenge is_active toggle — maintainer control over the CTF catalog itself, correctly gated."
+
+- id: cc.web.badges
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/badges/
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/badges.py:66-114"}
+
+- id: cc.api.badges.toggle
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/badges/api/toggle
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/badges.py:115+"}
+
+- id: cc.web.users_list
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/users/
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/users.py:210-226"}
+
+- id: cc.web.users_detail
+  component: cc
+  interaction_type: http_route
+  method: GET
+  path: /cc/users/{user_id}
+  parameters: [{name: user_id, location: path, type: string, required: true}]
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/users.py:227-243"}
+
+- id: cc.api.users.kill_sessions
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/users/api/{user_id}/kill-sessions
+  parameters: [{name: user_id, location: path, type: string, required: true}]
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/users.py:244-263"}
+  notes: "Player session termination — correctly maintainer-gated destructive-toward-users operation."
+
+- id: cc.api.users.delete_profile
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/users/api/{user_id}/delete-profile
+  parameters: [{name: user_id, location: path, type: string, required: true}]
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/users.py:264-283"}
+
+- id: cc.api.users.toggle_active
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/users/api/{user_id}/toggle-active
+  parameters: [{name: user_id, location: path, type: string, required: true}]
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/users.py:284-309"}
+
+- id: cc.api.users.full_ctf_reset
+  component: cc
+  interaction_type: http_route
+  method: POST
+  path: /cc/users/api/{user_id}/full-ctf-reset
+  parameters: [{name: user_id, location: path, type: string, required: true}]
+  reachability: {status: blocked_by_control, notes: ""}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/cc/routes/users.py:310+"}
+  notes: >
+    Most destructive single operation found across the whole platform
+    (full per-player CTF progress wipe) — the fact that this, kill-sessions,
+    delete-profile, and the access-grant endpoint are ALL behind the one
+    real RBAC gate, while every genuinely exploitable game-content surface
+    (tool poisoning, agent chat, vendor CRUD) sits behind nothing but a
+    session cookie, is itself the clearest piece of ground truth in this
+    whole sweep about where this application's actual trust boundary is
+    drawn: game-content mutation is intentionally open (it's the CTF),
+    platform/player-account mutation is not.

@@ -1,0 +1,396 @@
+# L1 ground truth — CTF Portal (finbot/apps/ctf), mounted at /ctf
+# Scoring, challenges, badges, profile, activity feed, and the Hacker
+# Toolkit's CTF-portal-side twin (toolkit.py mirrors darklab's toolkit.py —
+# same DeadDrop/ExfilData models, likely the same underlying repos; not
+# independently diffed line-by-line against darklab_portal/l1_darklab.yaml
+# in this pass, flagged as a duplication to verify rather than asserted
+# identical). Same bare get_session_context auth posture as vendor/admin/
+# darklab/labs throughout, EXCEPT the share-card routes, which have no
+# session dependency at all — genuinely public, unauthenticated, exact
+# fully-anonymous requests.
+
+- id: ctf.web.root
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: "confirmed live: 302 -> /ctf/dashboard"}
+  visibility: black_box_observable
+  evidence: {black_box: "curl -> 302", source_ref: "finbot/apps/ctf/routes/web.py:29-34"}
+
+- id: ctf.web.dashboard
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/dashboard
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: "confirmed live: 200"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:35-46"}
+
+- id: ctf.web.challenges
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/challenges
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:47-58"}
+
+- id: ctf.web.challenge_detail
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: "/ctf/challenges/{challenge_id} (exact path not fully confirmed -- decorator spans web.py:59-77, multi-line, param name inferred)"
+  parameters: [{name: challenge_id, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: "reachability inferred, not independently curl-confirmed in this pass"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:59-77"}
+
+- id: ctf.web.activity
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/activity
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:78-89"}
+
+- id: ctf.web.badges
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/badges
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:90-101"}
+
+- id: ctf.web.profile_own
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: "/ctf/profile (path spans web.py:102-116, multi-line decorator; exact literal not independently confirmed)"
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: "unconfirmed exact path in this pass"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:102-116"}
+
+- id: ctf.web.public_profile
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/h/{username}
+  ui_trigger: "shared profile link"
+  parameters: [{name: username, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: "public-profile page for any username, by design (shareable)"}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/web.py:117-129"}
+
+- id: ctf.api.challenges.list
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/challenges
+  parameters:
+    - {name: category, location: query, type: "string|null", required: false}
+    - {name: difficulty, location: query, type: "string|null", required: false}
+    - {name: status, location: query, type: "string|null", required: false}
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/challenges.py:81-124"}
+  notes: "This endpoint (plus challenges.get below) is effectively the ground-truth CATALOG itself, served to any session — an unauthenticated/low-friction black-box tester can enumerate every challenge id, hint cost, and (per-item) labels/prerequisites/detector-adjacent metadata simply by browsing here, without needing white-box repo access at all. Materially changes several visibility ratings elsewhere in this dataset from grey/white-box to black-box-observable-via-this-endpoint -- worth reconciling in a later consistency pass rather than silently re-labeling already-written records."
+
+- id: ctf.api.challenges.get
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/challenges/{challenge_id}
+  parameters: [{name: challenge_id, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/challenges.py:125-208"}
+  notes: "Returns full description, hints array, labels, prerequisites, resources -- i.e. the ENTIRE challenge YAML content except detector_class/detector_config (server-side-only fields per the ChallengeDetail model at line 37-60, which omits them). Confirms detector internals specifically are the one thing intentionally kept white-box-only even though everything else about a challenge is black-box-observable by design."
+
+- id: ctf.api.challenges.check
+  component: ctf
+  interaction_type: http_route
+  method: POST
+  path: /ctf/api/v1/challenges/{challenge_id}/check
+  parameters: [{name: challenge_id, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  authz_check_location: in_handler
+  authz_check_detail: "explicit `if not session_context: raise 401` despite get_session_context always returning a context object for any request that reached this far -- effectively dead code, not a real gate"
+  state_preconditions: ["CSRF token header present"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/challenges.py:210-258"}
+  notes: >
+    Does NOT run detection itself -- it reflects UserChallengeProgress rows
+    already written by the async event-pipeline (finbot/ctf/processor +
+    detectors), and records a `record_attempt` side effect on every call
+    regardless of outcome. This is the black-box "did I win yet" polling
+    endpoint referenced throughout l2_full_catalog.yaml's observable_evidence
+    fields.
+
+- id: ctf.api.challenges.hint
+  component: ctf
+  interaction_type: http_route
+  method: POST
+  path: /ctf/api/v1/challenges/{challenge_id}/hint
+  parameters: [{name: challenge_id, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  state_preconditions: ["CSRF token header present"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/challenges.py:261+"}
+  notes: "Points-cost side effect (hints_cost accrual) -- a scoring-affecting write behind a GET-shaped 'give me info' action, correctly a POST."
+
+- id: ctf.api.badges.list
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/badges
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/badges.py:51-116"}
+
+- id: ctf.api.badges.get
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/badges/{badge_id}
+  parameters: [{name: badge_id, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/badges.py:117+"}
+
+- id: ctf.api.activity
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/activity
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/activity.py:113+"}
+
+- id: ctf.api.stats
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/stats
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/stats.py:45+"}
+
+- id: ctf.api.sidecar
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/sidecar
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/sidecar.py:29-118"}
+  notes: "Feeds the CTF progress widget embedded in the Vendor Portal chrome -- points/completion/badges/recent-activity/in-progress-challenges in one call, all namespace-scoped via the repos it uses."
+
+- id: ctf.api.toolkit.dead_drop.list
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/dead-drop
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/toolkit.py:73-94"}
+  notes: "Apparent duplicate surface of darklab.api.toolkit.dead_drop.list -- not diffed line-by-line; if genuinely identical, this is two independent L1 realizations of the same L2 business capability, which matters for L2 realizing_l1_ids completeness."
+
+- id: ctf.api.toolkit.dead_drop.stats
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/dead-drop/stats
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/toolkit.py:95-105"}
+
+- id: ctf.api.toolkit.dead_drop.get
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/dead-drop/{message_id}
+  parameters: [{name: message_id, location: path, type: int, required: true}]
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/toolkit.py:106-178"}
+
+- id: ctf.api.toolkit.exfil_data.list
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/exfil-data
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/toolkit.py:179-200"}
+
+- id: ctf.api.toolkit.exfil_data.stats
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/exfil-data/stats
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/toolkit.py:201-210"}
+
+- id: ctf.api.toolkit.exfil_data.get
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/exfil-data/{event_id}
+  parameters: [{name: event_id, location: path, type: int, required: true}]
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/toolkit.py:211+"}
+
+- id: ctf.api.profile.get
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/profile
+  auth_requirement: "session:temporary"
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/profile.py:301-315"}
+
+- id: ctf.api.profile.update
+  component: ctf
+  interaction_type: http_route
+  method: PUT
+  path: /ctf/api/v1/profile
+  auth_requirement: "session:temporary"
+  state_preconditions: ["CSRF token header present"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/profile.py:316-368"}
+  notes: "Sets the public username used by ctf.web.public_profile / ctf.api.share.profile_card -- a namespacing/impersonation-adjacent surface worth checking for username collisions or reserved-word bypass (not tested black-box in this pass)."
+
+- id: ctf.api.profile.featured_badges
+  component: ctf
+  interaction_type: http_route
+  method: PUT
+  path: /ctf/api/v1/profile/featured-badges
+  auth_requirement: "session:temporary"
+  state_preconditions: ["CSRF token header present"]
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/profile.py:369-394"}
+
+- id: ctf.api.profile.check_username
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/profile/check-username/{username}
+  parameters: [{name: username, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/profile.py:395-423"}
+  notes: "Username-enumeration-shaped endpoint by nature (availability oracle) -- standard for this feature, flagged for completeness not as a novel finding."
+
+- id: ctf.api.profile.public_get
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/profile/u/{username}
+  parameters: [{name: username, location: path, type: string, required: true}]
+  auth_requirement: "session:temporary"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/profile.py:424+"}
+
+- id: ctf.api.share.profile_card
+  component: ctf
+  direction: entry
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/profile/{username}/card.png
+  parameters:
+    - {name: username, location: path, type: string, required: true}
+    - {name: html, location: query, type: bool, required: false, source: "default false; true returns raw HTML instead of rendered PNG -- documented as 'debug mode'"}
+  auth_requirement: "none"
+  authz_check_location: none
+  authz_check_detail: >
+    Only `db: Session = Depends(get_db)` -- NO session_context dependency
+    at all, unlike every other route catalogued across this entire
+    platform. Genuinely anonymous, unauthenticated, no session cookie
+    required or even set.
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/share.py:181-230ish; finbot/apps/ctf/rendering.py (Playwright renderer)"}
+  notes: >
+    Server-side HTML-to-PNG rendering (Playwright/Chromium) of a template
+    populated with public-profile data (username, badges, completed
+    challenges). Two things worth a closer follow-up pass, not confirmed
+    exploitable here: (1) whether any of the interpolated profile fields
+    (e.g. a player-chosen display name) are escaped before being placed
+    into the rendered HTML template, since this is a genuine SSR-to-image
+    pipeline and template/HTML injection here would be a real, publicly
+    reachable finding, not merely a CTF-internal one; (2) the `html=true`
+    debug switch returning raw markup is itself a bigger recon surface
+    than the PNG output for probing (1).
+
+- id: ctf.api.share.badge_card
+  component: ctf
+  interaction_type: http_route
+  method: GET
+  path: /ctf/api/v1/badge/{username}/{badge_id}/card.png
+  parameters:
+    - {name: username, location: path, type: string, required: true}
+    - {name: badge_id, location: path, type: string, required: true}
+  auth_requirement: "none"
+  authz_check_location: none
+  reachability: {status: black_box_reachable, notes: ""}
+  visibility: black_box_observable
+  evidence: {source_ref: "finbot/apps/ctf/routes/share.py:316+"}
+  notes: "Same public/unauthenticated posture and same follow-up items as ctf.api.share.profile_card."
+
+- id: ctf.api.admin_placeholder
+  component: ctf
+  interaction_type: http_route
+  method: "n/a — zero routes currently defined"
+  path: "(none yet — router mounted with prefix /api/v1 but empty)"
+  auth_requirement: "n/a"
+  reachability: {status: unreachable_in_source, notes: "no @router decorators exist in this file; included purely for completeness of white-box ground truth"}
+  visibility: white_box_required
+  evidence: {source_ref: "finbot/apps/ctf/routes/admin.py:1-12"}
+  notes: >
+    Literal file docstring: "TODO: Protect these routes / Take care of CSRF
+    protection (Super Admin portal should take care of this)". Zero risk
+    today (nothing to reach), but ground truth should record it as a
+    documented future-risk placeholder: whoever adds routes here later may
+    reasonably assume "Super Admin portal" (i.e. CC) auth applies, when in
+    fact this router is mounted into ctf_app, not cc_app, and would inherit
+    ctf_app's bare-session posture unless someone deliberately wires a
+    guard -- the same mistake pattern already present in Admin/Dark Lab/Labs.
