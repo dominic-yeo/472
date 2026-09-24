@@ -1,0 +1,369 @@
+# L2 — Semantic / stateful attack surface for Lunary (self-hosted)
+# One record = one business-meaningful operation. Realized by one or more L1 interactions
+# (see L1_attack_surface.yaml for endpoint detail). Focus: how values move component-to-component,
+# and how the LLM/agentic pieces interact.
+# Scope: intended vulnerable application only; CTF scaffolding excluded.
+#
+# Component vocabulary (matches L1.component): frontend | api | auth | webhooks | legacy
+# plus external actors referenced in flows:
+#   sdk            : lunary-js / lunary-py tracer (external app being observed)
+#   llm_provider   : OpenAI / Anthropic / OpenRouter (via utils/playground.runAImodel + litellm)
+#   stripe         : Stripe API + webhook
+#   email          : outbound mail (verify / reset / lifecycle)
+#   postgres       : the single shared DB (tenanted only by project_id / org_id columns)
+#
+# Recurring tenancy note used across records:
+#   - JWT carries {userId, orgId}. projectId is NOT in the JWT; it is supplied per-request as
+#     ?projectId= (or as the bearer on public/SDK routes) and copied to ctx.state.projectId by
+#     authMiddleware, which — on JWT requests — verifies the project belongs to the caller's org.
+#     Handlers then rely on `where project_id = ctx.state.projectId` (repository_layer) for row
+#     isolation. Several handlers omit that clause (tracked per-record + in L1 authz_check_location).
+
+operations:
+
+  # ========================================================= IDENTITY / AUTH ==
+  - id: auth.account.provision
+    semantic_operation: "Register a new tenant: create org + admin account + first project + API keys, receive session JWT"
+    business_objects: [Org, Account, Project, ApiKey, SessionToken]
+    realizing_l1_ids: [auth.signup]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: fe.pages, parameter: "signup form fields"}, to: {component: auth, l1_id: auth.signup, parameter: "body{email,password,name,orgName,projectName,signupMethod}"}, transformation: "serialized JSON; zod-validated"}
+      - {from: {component: auth, l1_id: auth.signup, parameter: "password"}, to: {component: postgres, l1_id: null, parameter: "account.password_hash"}, transformation: "argon2 hash"}
+      - {from: {component: auth, l1_id: auth.signup, parameter: "project.id"}, to: {component: postgres, l1_id: null, parameter: "api_key.api_key (public key = project.id)"}, transformation: "reused verbatim as the public API key"}
+      - {from: {component: auth, l1_id: auth.signup, parameter: "{userId,email,orgId}"}, to: {component: frontend, l1_id: auth.login, parameter: "JWT token"}, transformation: "HS256 signed with JWT_SECRET; stored client-side"}
+      - {from: {component: auth, l1_id: auth.signup, parameter: "email,name"}, to: {component: email, l1_id: null, parameter: "verification email"}, transformation: "sendVerifyEmail"}
+    preconditions: ["email not already present", "signupMethod in {signup,join}"]
+    effect_state_transition: "INSERT org, account(role=admin, verified=SKIP_EMAIL_VERIFY), project, api_key(public+private); signupMethod=join instead inserts account(role=member) into body-supplied orgId"
+    observable_evidence: ["200 with {token}", "subsequent /users/me/org shows the org+member", "verification email in dev inbox"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "public"}
+    source_ref: "packages/backend/src/api/v1/auth/index.ts:14"
+    notes: "public API key == project UUID: the same value authorizes ingest and is listed to org members via api.projects.list."
+
+  - id: auth.session.obtain
+    semantic_operation: "Authenticate and mint a 1-month session JWT"
+    business_objects: [Account, SessionToken]
+    realizing_l1_ids: [auth.login]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: fe.pages, parameter: "login{email,password}"}, to: {component: auth, l1_id: auth.login, parameter: body, transformation: "JSON"}}
+      - {from: {component: postgres, l1_id: null, parameter: "account.password_hash"}, to: {component: auth, l1_id: auth.login, parameter: "verifyPassword(argon2|bcrypt)"}, transformation: "hash compare"}
+      - {from: {component: auth, l1_id: auth.login, parameter: "{userId,email,orgId}"}, to: {component: frontend, l1_id: null, parameter: "JWT"}, transformation: "signJwt"}
+    preconditions: ["account exists"]
+    effect_state_transition: "no DB write; returns JWT"
+    observable_evidence: ["200 {token}"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "confirmed live with user_b credentials"}
+    source_ref: "packages/backend/src/api/v1/auth/index.ts:150"
+
+  - id: auth.password.recover
+    semantic_operation: "Reset an account password via emailed JWT token"
+    business_objects: [Account, RecoveryToken, SessionToken]
+    realizing_l1_ids: [auth.request_password_reset, auth.reset_password]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: auth.request_password_reset, parameter: "body.email"}, to: {component: auth, l1_id: null, parameter: "signJwt({email},1h)"}, transformation: "email embedded in JWT claim"}
+      - {from: {component: auth, l1_id: null, parameter: "recovery JWT"}, to: {component: postgres, l1_id: null, parameter: "account.recovery_token"}, transformation: "stored"}
+      - {from: {component: auth, l1_id: null, parameter: "reset link (APP_URL/reset-password?token=)"}, to: {component: email, l1_id: null, parameter: "email body"}, transformation: "sendEmail"}
+      - {from: {component: frontend, l1_id: auth.reset_password, parameter: "body{token,password}"}, to: {component: auth, l1_id: auth.reset_password, parameter: "verifyJwt(token).email"}, transformation: "email read from token, NOT from stored recovery_token"}
+      - {from: {component: auth, l1_id: auth.reset_password, parameter: "new password"}, to: {component: postgres, l1_id: null, parameter: "account.password_hash for token.email"}, transformation: "argon2 hash + issue fresh JWT"}
+    preconditions: ["reset: a JWT signed by JWT_SECRET carrying {email}"]
+    effect_state_transition: "UPDATE account.password_hash; returns session JWT"
+    observable_evidence: ["request always returns {}/{ok:true}", "reset returns {token}"]
+    visibility: grey_box_required
+    reachability: {status: black_box_reachable, notes: "reset validates token signature only; does not compare to stored recovery_token"}
+    source_ref: "packages/backend/src/api/v1/auth/index.ts:180,207"
+
+  - id: auth.email.verify
+    semantic_operation: "Mark an account email verified from an emailed token"
+    business_objects: [Account]
+    realizing_l1_ids: [api.users.verify_email, api.users.send_verification]
+    parameter_flow:
+      - {from: {component: api, l1_id: api.users.verify_email, parameter: "query.token"}, to: {component: api, l1_id: null, parameter: "jwtVerify(token).email"}, transformation: "email from JWT claim"}
+      - {from: {component: api, l1_id: null, parameter: "verified=true"}, to: {component: postgres, l1_id: null, parameter: "account.verified for token.email"}, transformation: "UPDATE + 302 to APP_URL"}
+    preconditions: ["token JWT with {email}"]
+    effect_state_transition: "UPDATE account.verified=true; sends WELCOME_EMAIL"
+    observable_evidence: ["302 redirect to APP_URL", "verified flag flips in /users/me"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "public"}
+    source_ref: "packages/backend/src/api/v1/users.ts:96"
+
+  - id: team.member.manage
+    semantic_operation: "View org members and remove a member from the org"
+    business_objects: [Org, Account]
+    realizing_l1_ids: [api.users.me_org, api.users.get, api.users.remove]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.users.me_org, parameter: "JWT.orgId"}, to: {component: postgres, l1_id: null, parameter: "account where org_id=orgId"}, transformation: "list members incl. role"}
+      - {from: {component: frontend, l1_id: api.users.remove, parameter: "path.userId"}, to: {component: postgres, l1_id: null, parameter: "account.org_id=NULL where id=userId"}, transformation: "soft-remove; guarded by caller.role=='admin' + same-org check"}
+    preconditions: ["session:jwt", "remove requires role:admin"]
+    effect_state_transition: "UPDATE account.org_id=NULL"
+    observable_evidence: ["member disappears from /users/me/org list"]
+    visibility: grey_box_required
+    reachability: {status: black_box_reachable, notes: "user_b is admin of TechNova"}
+    source_ref: "packages/backend/src/api/v1/users.ts:12,144,160"
+
+  # ============================================================ PROJECTS ======
+  - id: project.lifecycle
+    semantic_operation: "Create / rename / delete projects and expose their public+private API keys"
+    business_objects: [Project, ApiKey, Org]
+    realizing_l1_ids: [api.projects.list, api.projects.create, api.projects.update, api.projects.delete]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.projects.list, parameter: "JWT.orgId"}, to: {component: postgres, l1_id: null, parameter: "project where org_id=orgId + api_key subselects"}, transformation: "returns publicApiKey & privateApiKey inline"}
+      - {from: {component: frontend, l1_id: api.projects.create, parameter: "body.name + JWT.orgId"}, to: {component: postgres, l1_id: null, parameter: "INSERT project + api_key(public=project.id, private)"}, transformation: "free-plan cap enforced in handler"}
+      - {from: {component: frontend, l1_id: api.projects.delete, parameter: "path.projectId"}, to: {component: postgres, l1_id: null, parameter: "DELETE project where id=projectId"}, transformation: "org-wide count>1 guard only; no org_id match on the delete"}
+    preconditions: ["session:jwt"]
+    effect_state_transition: "INSERT/UPDATE/DELETE project and api_key rows"
+    observable_evidence: ["project list reflects change", "api keys visible in response and /settings"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "delete/update scope only by project id (see L1 authz_check_location)"}
+    source_ref: "packages/backend/src/api/v1/projects/index.ts"
+    notes: "privateApiKey is returned to any org member via list; the public key is the projectId itself."
+
+  - id: org.billing.manage
+    semantic_operation: "Read org/plan, open Stripe billing portal, initiate plan upgrade; reconcile via Stripe webhook"
+    business_objects: [Org, StripeCustomer, StripeSubscription]
+    realizing_l1_ids: [api.orgs.get, api.orgs.update, api.orgs.usage, api.orgs.billing_portal, api.orgs.upgrade, webhooks.stripe]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.orgs.upgrade, parameter: "body{plan,period,origin}"}, to: {component: stripe, l1_id: null, parameter: "checkout.session(price lookup=plan_period, success_url=origin/..)"}, transformation: "origin reflected into redirect URLs; client_reference_id=orgId"}
+      - {from: {component: stripe, l1_id: webhooks.stripe, parameter: "event(checkout.session.completed).client_reference_id"}, to: {component: postgres, l1_id: null, parameter: "org.plan/stripe_subscription/play_allowance"}, transformation: "signature-verified; UPDATE org by client_reference_id or stripe_customer"}
+      - {from: {component: postgres, l1_id: api.orgs.get, parameter: "org.stripe_customer/subscription"}, to: {component: frontend, l1_id: api.orgs.get, parameter: "response body"}, transformation: "returned to any org member (path :orgId ignored, uses JWT.orgId)"}
+    preconditions: ["session:jwt for orgs.*", "Stripe keys for portal/upgrade", "STRIPE_WEBHOOK_SECRET + valid signature for webhook"]
+    effect_state_transition: "Stripe objects created/updated; org plan/subscription/allowance mutated; lifecycle emails + Telegram notifications sent"
+    observable_evidence: ["checkout URL returned", "plan change visible in /users/me/org", "emails to org members"]
+    visibility: grey_box_required
+    reachability: {status: conditionally_mounted, notes: "billing paths depend on Stripe config; org read/update always live"}
+    source_ref: "packages/backend/src/api/v1/orgs.ts ; packages/backend/src/api/webhooks/stripe.ts"
+
+  # =================================================== LLM / AGENTIC: PLAYGROUND
+  - id: llm.playground.run
+    semantic_operation: "Run a prompt in the Playground: compile a chat template with variables + model params/tools and stream a completion from an LLM provider"
+    business_objects: [Org, PromptTemplateContent, LLMRequest, LLMResponseStream]
+    realizing_l1_ids: [api.orgs.playground]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.orgs.playground, parameter: "body.content (chat messages, may contain {{var}})"}, to: {component: api, l1_id: null, parameter: "compileChatMessages(content, variables)"}, transformation: "deep copy; regex /{{(.*?)}}/ replaced by variables[key] (compileTemplate)"}
+      - {from: {component: frontend, l1_id: api.orgs.playground, parameter: "body.variables (record<string,string>)"}, to: {component: api, l1_id: null, parameter: "template substitution map"}, transformation: "unmatched vars -> '' ; substituted inline into message content"}
+      - {from: {component: api, l1_id: null, parameter: "compiled messages"}, to: {component: api, l1_id: null, parameter: "convertInputToOpenAIMessages() (role 'ai'->'assistant')"}, transformation: "shape normalized to OpenAI messages"}
+      - {from: {component: frontend, l1_id: api.orgs.playground, parameter: "body.extra{model,temperature,max_tokens,top_p,top_k,presence/frequency_penalty,stop,functions,tools,seed}"}, to: {component: llm_provider, l1_id: null, parameter: "chat.completions.create params"}, transformation: "passed through verbatim; model routed to OpenAI/Anthropic(litellm)/OpenRouter by MODELS registry"}
+      - {from: {component: llm_provider, l1_id: null, parameter: "streamed choices/tokens"}, to: {component: frontend, l1_id: api.orgs.playground, parameter: "SSE JSON lines"}, transformation: "handleStream() merges deltas (content, function_call, tool_calls) and writes newline-delimited JSON"}
+      - {from: {component: api, l1_id: null, parameter: "play_allowance"}, to: {component: postgres, l1_id: null, parameter: "org.play_allowance -= 1"}, transformation: "decrement before call"}
+    preconditions: ["session:jwt", "org.play_allowance > 0 (observed 20)", "provider API key configured for chosen model"]
+    effect_state_transition: "org.play_allowance decremented; outbound LLM API call; response streamed (not persisted as a run here)"
+    observable_evidence: ["SSE stream of JSON token objects", "play_allowance drops on /users/me/org"]
+    visibility: black_box_observable
+    reachability: {status: conditionally_mounted, notes: "streams only if a provider key is present; allowance gate otherwise blocks"}
+    source_ref: "packages/backend/src/api/v1/orgs.ts:210 ; packages/backend/src/utils/playground.ts"
+    notes: >
+      AGENTIC CORE. The caller fully controls the message array, the {{variable}} values merged into it,
+      and the tools/functions schema offered to the model. content+variables are the user-prompt source;
+      tools/functions are the tool surface advertised to the LLM; the model + provider routing is caller-chosen.
+      No server-side system prompt or guardrail is injected here.
+
+  # =================================================== LLM / AGENTIC: TEMPLATES
+  - id: prompt.template.author
+    semantic_operation: "Author and version reusable prompt templates (content + variables/testValues + model config) consumed later by SDKs and evaluations"
+    business_objects: [Template, TemplateVersion, PromptContent]
+    realizing_l1_ids: [api.templates.list, api.templates.create, api.templates.get, api.templates.update, api.templates.version.create, api.template_versions.get, api.template_versions.update, api.template_versions.latest]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.templates.create, parameter: "body{slug,mode,content,extra,testValues,isDraft}"}, to: {component: postgres, l1_id: null, parameter: "template + template_version rows"}, transformation: "content/extra/testValues stored as JSON; extra keys unCamel'd (unCamelObject)"}
+      - {from: {component: sdk, l1_id: api.template_versions.latest, parameter: "query.slug + bearer projectId"}, to: {component: postgres, l1_id: null, parameter: "latest non-draft version by slug in project"}, transformation: "returned to SDK with snake_case keys for OpenAI SDK compatibility"}
+      - {from: {component: sdk, l1_id: api.template_versions.latest, parameter: "template content {{variables}}"}, to: {component: sdk, l1_id: null, parameter: "SDK-side compileTemplate then LLM call in the observed app"}, transformation: "variable substitution happens in the external app, not in Lunary"}
+    preconditions: ["author: session:jwt", "fetch latest: project-scoped (public route)"]
+    effect_state_transition: "INSERT/UPDATE template + template_version"
+    observable_evidence: ["template appears in /prompts", "SDK receives version JSON"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "template_versions.update scopes by version id only (no project/org clause)"}
+    source_ref: "packages/backend/src/api/v1/templates.ts ; packages/backend/src/api/v1/templateVersions.ts"
+    notes: "Templates are the stored-prompt supply chain: what the Playground and external SDK apps feed to an LLM."
+
+  # =================================================== LLM / AGENTIC: EVALS ====
+  - id: eval.dataset.author
+    semantic_operation: "Build evaluation datasets: dataset -> prompts (chat messages) -> variations (variables, context, idealOutput)"
+    business_objects: [Dataset, DatasetPrompt, DatasetPromptVariation]
+    realizing_l1_ids: [api.datasets.list, api.datasets.get, api.datasets.create, api.datasets.update, api.datasets.delete, api.datasets.prompt.create, api.datasets.prompt.get, api.datasets.prompt.update, api.datasets.prompt.delete, api.datasets.variation.create, api.datasets.variation.get, api.datasets.variation.update, api.datasets.variation.delete]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.datasets.prompt.update, parameter: "body.messages"}, to: {component: postgres, l1_id: null, parameter: "dataset_prompt.messages"}, transformation: "stored as JSON chat array"}
+      - {from: {component: frontend, l1_id: api.datasets.variation.update, parameter: "body{variables,context,idealOutput}"}, to: {component: postgres, l1_id: null, parameter: "dataset_prompt_variation row"}, transformation: "clearUndefined; stored; later merged into prompt at eval time"}
+    preconditions: ["mostly project-scoped; many subroutes are public (regex /v1/datasets/.+) and several skip project/org scoping — see L1"]
+    effect_state_transition: "INSERT/UPDATE/DELETE dataset* rows"
+    observable_evidence: ["dataset/prompt/variation visible in /datasets/:id"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "prompt/variation get/update/delete look up by id alone"}
+    source_ref: "packages/backend/src/api/v1/datasets/index.ts"
+
+  - id: eval.checklist.author
+    semantic_operation: "Author checklists — trees of checks (deterministic + AI-graded) applied to LLM outputs"
+    business_objects: [Checklist, FilterLogic]
+    realizing_l1_ids: [api.checklists.list, api.checklists.get, api.checklists.create, api.checklists.update, api.checklists.delete]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.checklists.create, parameter: "body.data (FilterLogic check tree)"}, to: {component: postgres, l1_id: null, parameter: "checklist.data (JSON)"}, transformation: "stored; interpreted later by runChecksOnRun"}
+    preconditions: ["session:jwt"]
+    effect_state_transition: "INSERT/UPDATE/DELETE checklist"
+    observable_evidence: ["checklist visible in /evaluations/checklists"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: null}
+    source_ref: "packages/backend/src/api/v1/checklists.ts"
+    notes: >
+      Check runner ids include AI-backed graders (sentiment, tone, factualness, toxicity, entities,
+      similarity, assertion, rouge, ...) alongside deterministic ones (regex, json, xml, length,
+      cost, tokens, string, ...). AI graders re-egress the run output to an LLM.
+
+  - id: eval.batch.run
+    semantic_operation: "Run an evaluation: fan out dataset prompts x variations x models to an LLM, grade each output with a checklist, store results"
+    business_objects: [Evaluation, EvaluationResult, DatasetPrompt, DatasetPromptVariation, Checklist, LLMRequest]
+    realizing_l1_ids: [api.evaluations.create, api.evaluations.get, api.evaluations.result, api.evaluations.list]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.evaluations.create, parameter: "body{datasetId,checklistId,models}"}, to: {component: postgres, l1_id: null, parameter: "evaluation row + getEvaluation() expansion"}, transformation: "loads dataset prompts+variations and checklist"}
+      - {from: {component: postgres, l1_id: null, parameter: "prompt.content + variation.variables"}, to: {component: api, l1_id: null, parameter: "compileChatMessages()"}, transformation: "{{var}} substitution per variation"}
+      - {from: {component: api, l1_id: null, parameter: "compiled messages + model"}, to: {component: llm_provider, l1_id: null, parameter: "runAImodel()"}, transformation: "one LLM call per (prompt x variation x model)"}
+      - {from: {component: llm_provider, l1_id: null, parameter: "choices[0].message (output)"}, to: {component: api, l1_id: null, parameter: "virtualRun.output"}, transformation: "wrapped in a virtual run for grading"}
+      - {from: {component: api, l1_id: null, parameter: "virtualRun + checklist.data"}, to: {component: api, l1_id: null, parameter: "runChecksOnRun()"}, transformation: "deterministic + AI checks -> {passed, results}"}
+      - {from: {component: api, l1_id: null, parameter: "output,results,passed,cost,tokens"}, to: {component: postgres, l1_id: null, parameter: "evaluation_result rows"}, transformation: "INSERT"}
+    preconditions: ["session:jwt", "provider API key configured (else runEval throws internally and result set stays empty)"]
+    effect_state_transition: "INSERT evaluation + evaluation_result; multiple outbound LLM calls"
+    observable_evidence: ["201 {evaluationId}", "rows via api.evaluations.result (result route not tenant-scoped)"]
+    visibility: grey_box_required
+    reachability: {status: conditionally_mounted, notes: "LLM fan-out requires a provider key; without it evaluation is created but yields no results"}
+    source_ref: "packages/backend/src/api/v1/evaluations/index.ts:12 ; packages/backend/src/api/v1/evaluations/utils.ts:runEval"
+
+  - id: eval.sdk.run
+    semantic_operation: "SDK-driven single evaluation: grade a supplied input/output pair against a checklist slug"
+    business_objects: [Checklist, VirtualRun, CheckResult]
+    realizing_l1_ids: [api.evaluations.run]
+    parameter_flow:
+      - {from: {component: sdk, l1_id: api.evaluations.run, parameter: "body{checklist(slug),input,output,idealOutput,context,model,duration}"}, to: {component: postgres, l1_id: null, parameter: "checklist by slug in projectId"}, transformation: "projectId from bearer/query (public route)"}
+      - {from: {component: api, l1_id: null, parameter: "input/output -> virtualRun"}, to: {component: api, l1_id: null, parameter: "runChecksOnRun(virtualRun, checklist.data)"}, transformation: "AI-graded checks re-egress output to an LLM"}
+    preconditions: ["checklist slug exists in target project"]
+    effect_state_transition: "no persistent write; returns {passed, results}; may trigger outbound LLM calls for AI checks"
+    observable_evidence: ["JSON {passed, results}"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "public route; projectId asserted only via bearer/query"}
+    source_ref: "packages/backend/src/api/v1/evaluations/index.ts:94"
+
+  # =================================================== OBSERVABILITY INGEST ====
+  - id: telemetry.run.ingest
+    semantic_operation: "Ingest LLM/agent/tool/chain/log trace events from an external app into runs (the observability write path)"
+    business_objects: [Run, Log, ExternalUser, ModelNameCache, TagCache]
+    realizing_l1_ids: [api.runs.ingest, legacy.report]
+    parameter_flow:
+      - {from: {component: sdk, l1_id: api.runs.ingest, parameter: "Authorization: Bearer <projectId> (or ?projectId=)"}, to: {component: api, l1_id: null, parameter: "ctx.state.projectId"}, transformation: "authMiddleware copies bearer/query into projectId (public route, UUID trusted as-is)"}
+      - {from: {component: sdk, l1_id: api.runs.ingest, parameter: "body.events[] (type llm|chain|agent|tool|log|chat|thread; event start|end|error|feedback|chat)"}, to: {component: api, l1_id: null, parameter: "cleanEvent() -> recursiveToCamel, ensureIsUUID(runId/parentRunId)"}, transformation: "keys camel-cased; arbitrary string ids hashed to UUIDs; timestamps normalized"}
+      - {from: {component: api, l1_id: null, parameter: "event.userId + userProps"}, to: {component: postgres, l1_id: null, parameter: "external_user upsert (external_id, project_id, props)"}, transformation: "auto-creates external_user rows keyed by caller-supplied userId"}
+      - {from: {component: api, l1_id: null, parameter: "event fields (input,output,params,tags,name,error,tokensUsage)"}, to: {component: postgres, l1_id: null, parameter: "run row insert/update by runId; cost via calcRunCost"}, transformation: "start=INSERT, end/error/feedback=UPDATE by runId (no project match on update)"}
+      - {from: {component: api, l1_id: null, parameter: "log events"}, to: {component: postgres, l1_id: null, parameter: "log(run, project_id, level, message, extra)"}, transformation: "INSERT"}
+    preconditions: ["a project UUID (== public API key); no JWT"]
+    effect_state_transition: "INSERT/UPDATE run, log, external_user; parent/child run linkage via parent_run_id (retry after 2s if parent missing)"
+    observable_evidence: ["runs appear in /logs and /traces", "external users in /users", "{results:[{id,success}]}"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "unauthenticated write keyed only by project UUID; run UPDATE paths match on runId alone"}
+    source_ref: "packages/backend/src/api/v1/runs/ingest.ts ; packages/backend/src/utils/ingest.ts"
+    notes: >
+      Primary external->platform trust boundary. Ingested 'agent'/'tool' runs are the traces of an
+      EXTERNAL agent (Lunary observes it; it does not execute the agent). Fields are attacker-controllable
+      and are later rendered in the dashboard and fed to filter/radar SQL and AI graders.
+
+  - id: telemetry.chat.ingest
+    semantic_operation: "Ingest chat/thread messages, reconciling user/assistant/tool messages into thread + exchange runs"
+    business_objects: [Run(thread), Run(message), ExternalUser]
+    realizing_l1_ids: [api.runs.ingest]
+    parameter_flow:
+      - {from: {component: sdk, l1_id: api.runs.ingest, parameter: "event(type=chat).message{role,content,extra,isRetry,tags}"}, to: {component: api, l1_id: null, parameter: "ingestChatEvent()"}, transformation: "coreMessage = {role,content,extra}"}
+      - {from: {component: api, l1_id: null, parameter: "parentRunId"}, to: {component: postgres, l1_id: null, parameter: "run(type=thread) upsert"}, transformation: "thread run created/updated as message container"}
+      - {from: {component: api, l1_id: null, parameter: "message role"}, to: {component: postgres, l1_id: null, parameter: "run input[] (user/system) or output[] (assistant/tool/bot)"}, transformation: "reconciliation: append to prior run, or new exchange, or sibling on retry"}
+    preconditions: ["project UUID", "parentRunId (thread id) defined"]
+    effect_state_transition: "upsert thread run; insert/append message exchange runs; retry creates sibling run"
+    observable_evidence: ["chat thread visible in /logs (thread view)"]
+    visibility: grey_box_required
+    reachability: {status: black_box_reachable, notes: "role classification drives whether content lands in input vs output"}
+    source_ref: "packages/backend/src/utils/ingest.ts:ingestChatEvent"
+
+  # =================================================== OBSERVABILITY READ ======
+  - id: telemetry.run.query
+    semantic_operation: "Query/filter/search/export runs from the dashboard using a serialized filter-logic tree compiled to SQL"
+    business_objects: [Run, ExternalUser]
+    realizing_l1_ids: [api.runs.list, api.runs.get, api.runs.get_public, api.runs.related, api.runs.update, api.runs.feedback, api.runs.usage]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.runs.list, parameter: "raw querystring (serialized filter logic + limit/page/parentRunId/exportType)"}, to: {component: api, l1_id: null, parameter: "shared.deserializeLogic(querystring)"}, transformation: "querystring -> nested [AND/OR, {id,params}] logic tree"}
+      - {from: {component: api, l1_id: null, parameter: "logic tree"}, to: {component: api, l1_id: null, parameter: "convertChecksToSQL() -> CHECK_RUNNERS[id].sql(params)"}, transformation: "each node mapped to a parameterized SQL fragment by its runner; AND/OR reduced"}
+      - {from: {component: api, l1_id: null, parameter: "SQL fragment + projectId + limit/offset"}, to: {component: postgres, l1_id: null, parameter: "select from run where project_id AND (filters)"}, transformation: "executed; rows mapped by formatRun"}
+      - {from: {component: api, l1_id: null, parameter: "rows"}, to: {component: frontend, l1_id: api.runs.list, parameter: "JSON, or CSV/JSONL when exportType set"}, transformation: "fileExport() when exportType in {csv,jsonl}"}
+    preconditions: ["list/get: session:jwt (+project belongs to org)", "get_public: run.is_public=true (none)", "feedback: public route"]
+    effect_state_transition: "read-only (update path toggles is_public/feedback/tags)"
+    observable_evidence: ["/logs table populated", "downloadable export file", "public trace link renders"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "runs.related and runs.feedback are not tenant-scoped / public (see L1)"}
+    source_ref: "packages/backend/src/api/v1/runs/index.ts ; packages/backend/src/utils/filters.ts ; packages/backend/src/checks"
+    notes: "Main structured-input -> SQL surface. Filter params reach per-runner sql() builders; runner coverage/quoting is the thing to characterize (not exploited here)."
+
+  - id: telemetry.filters.enumerate
+    semantic_operation: "Populate dashboard filter dropdowns (models, tags, feedbacks, users, radars) from cached/aggregated project data"
+    business_objects: [ModelNameCache, TagCache, Run(feedback), ExternalUser, Radar]
+    realizing_l1_ids: [api.filters.models, api.filters.tags, api.filters.feedbacks, api.filters.users, api.filters.radars]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.filters.models, parameter: "JWT + ?projectId"}, to: {component: postgres, l1_id: null, parameter: "cache/aggregate tables where project_id"}, transformation: "distinct lists returned"}
+    preconditions: ["session:jwt", "projectId in caller org"]
+    effect_state_transition: "read-only"
+    observable_evidence: ["filter dropdowns populate in /logs"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: null}
+    source_ref: "packages/backend/src/api/v1/filters.ts"
+
+  - id: telemetry.external_users.view
+    semantic_operation: "View tracked end-users of the observed app and their cost/usage"
+    business_objects: [ExternalUser, Run]
+    realizing_l1_ids: [api.external_users.list, api.external_users.runs_usage, api.external_users.get]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.external_users.list, parameter: "?projectId"}, to: {component: postgres, l1_id: null, parameter: "external_user where project_id + summed run cost"}, transformation: "project-scoped list"}
+      - {from: {component: frontend, l1_id: api.external_users.get, parameter: "path.id (int)"}, to: {component: postgres, l1_id: null, parameter: "external_user where id=:id"}, transformation: "no project/org scoping on single-get"}
+    preconditions: ["session:jwt"]
+    effect_state_transition: "read-only"
+    observable_evidence: ["/users table + /users/:id"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "single-get by sequential int id, not tenant-scoped"}
+    source_ref: "packages/backend/src/api/v1/external-users.ts"
+
+  # =================================================== RADARS (BATCH CHECKS) ===
+  - id: radar.rule.manage_and_evaluate
+    semantic_operation: "Define radar rules (view + checks filter-logic) that a background job evaluates against runs to flag matches"
+    business_objects: [Radar, RadarResult, Run]
+    realizing_l1_ids: [api.radars.list, api.radars.get, api.radars.chart, api.radars.create, api.radars.update, api.radars.delete]
+    parameter_flow:
+      - {from: {component: frontend, l1_id: api.radars.create, parameter: "body{description,view,checks,negative}"}, to: {component: postgres, l1_id: null, parameter: "radar.view/checks (JSON filter logic)"}, transformation: "stored; seeded with DEFAULT_RADARS on first list"}
+      - {from: {component: postgres, l1_id: null, parameter: "radar.view/checks"}, to: {component: api, l1_id: null, parameter: "radar batch job -> convertChecksToSQL + AI checks"}, transformation: "compiled to SQL and/or AI grader evaluations over project runs (backend radar.ts job)"}
+      - {from: {component: api, l1_id: null, parameter: "pass/fail"}, to: {component: postgres, l1_id: null, parameter: "radar_result rows"}, transformation: "INSERT; cleared when view/checks change"}
+    preconditions: ["session:jwt", "background radar job running (npm backend:radar)"]
+    effect_state_transition: "INSERT/UPDATE/DELETE radar; radar_result populated by job"
+    observable_evidence: ["/radars pass/fail counts + 7-day chart"]
+    visibility: grey_box_required
+    reachability: {status: conditionally_mounted, notes: "rule CRUD is live; evaluation depends on the radar job + (for AI checks) a provider key"}
+    source_ref: "packages/backend/src/api/v1/radars.ts ; packages/backend/src/radar.ts ; packages/backend/src/utils/filters.ts"
+    notes: "Same filter-logic -> SQL pipeline as telemetry.run.query, but stored and executed by a batch job rather than per-request."
+
+# ============================================================ CROSS-CUTTING ===
+cross_cutting:
+  auth_model:
+    summary: >
+      Two effective credentials: (1) a session JWT {userId,orgId} from auth.*, used for dashboard
+      routes and scoped to an org; (2) a project UUID (the public API key) presented as a bearer or
+      ?projectId=, used for SDK/ingest/public routes and scoped to a single project. projectId is
+      always request-supplied, never derived from the JWT.
+    public_route_allowlist_ref: "packages/backend/src/api/v1/auth/utils.ts:publicRoutes"
+    notes: >
+      The publicRoutes list includes broad regexes (/auth/.+, /v1/datasets/.+, /v1/runs/.+/public,
+      /v1/runs/.+/feedback) plus /v1/runs/ingest, /v1/evaluations/run, /v1/template_versions/latest,
+      /api/report, /api/v1/template. These define the unauthenticated reachable set.
+  tenancy:
+    summary: "Row isolation is by project_id/org_id SQL clauses in handlers. Endpoints that omit the clause are enumerated in L1 (authz_check_location: none) and flagged in the L2 records above."
+  llm_egress_points:
+    - "llm.playground.run (api.orgs.playground) — direct, caller-controlled messages/tools/model"
+    - "eval.batch.run + eval.sdk.run — outputs graded by AI checks -> LLM"
+    - "radar.rule.manage_and_evaluate — AI checks in the batch job -> LLM"
+    provider_routing: "utils/playground.runAImodel: MODELS registry -> OpenAI SDK | litellm(Anthropic) | OpenRouter; keys from env (OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY)."
+  agentic_data_model:
+    summary: >
+      Lunary OBSERVES external agents rather than running them. The 'agent'/'tool'/'chain'/'llm' run
+      types and chat threads are ingested traces (telemetry.run.ingest / telemetry.chat.ingest). The
+      only place Lunary itself calls an LLM is the Playground and the eval/radar graders. Relationships:
+        external app + its LLM/tool calls  --ingest-->  run tree (parent_run_id links agent->tool->llm)
+        prompt templates (authored here)   --SDK fetch-->  external app  --> LLM
+        dataset prompts + variations + checklist  --eval-->  Lunary calls LLM  --> AI-graded results
+        user Playground messages + tools/functions  --> Lunary calls LLM (SSE)
+  notable_unmounted:
+    - "api.analytics.* router not mounted (see L1 not_mounted); black-box 401 unauth / would 404 authed."

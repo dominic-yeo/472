@@ -1,0 +1,727 @@
+# L1 — vendor sub-app (finbot/apps/vendor/**, mounted at /vendor)
+# Schema: FinBot_attack_surface/schema/L1_schema.yaml
+# component = "vendor" for all records. Live-confirmed via /vendor/openapi.json (33 paths, 2026-09-19).
+#
+# Cross-cutting facts for this whole file:
+#   - ALL 33 routes depend on get_session_context (finbot/core/auth/middleware.py:156-161) —
+#     a bare anonymous/temporary session is sufficient. None use
+#     get_authenticated_session_context. auth_requirement is therefore
+#     "session:temporary" for every record unless noted.
+#   - authz_check_location "repository_layer" = NamespacedRepository filters by
+#     session_context.namespace only (finbot/core/data/repositories.py:30-45).
+#     "in_handler" = the route additionally compares the fetched row's vendor_id/id
+#     to session_context.current_vendor_id and 403s on mismatch (stronger).
+#   - current_vendor_id is loaded onto the session only for /vendor-prefixed requests
+#     (finbot/core/auth/middleware.py:38-41,99-109), auto-selecting the namespace's
+#     first vendor if none was chosen yet (finbot/core/auth/session.py:859-868).
+#   - CSRF header required on every POST/PUT/DELETE (no /vendor/ exemption in
+#     finbot/core/auth/csrf.py:29-38); frontend auto-attaches it via
+#     finbot/static/js/common/api.js:48-54 reading <meta name="csrf-token">.
+
+records:
+  - id: vendor.web.home
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /
+    ui_trigger: "browser navigation to /vendor/"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 200, live"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py:19-35"}
+    notes: "Pure router; redirects to /vendor/onboarding, /vendor/select-vendor, or /vendor/dashboard based on vendor_repo.get_vendor_count() and requires_vendor_selection()."
+
+  - id: vendor.web.onboarding
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /onboarding
+    ui_trigger: "reached via / redirect when the namespace has zero vendors"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "listed in openapi.json"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "Renders onboarding.html, backing form posts to vendor.api.vendors.register."
+
+  - id: vendor.web.select_vendor
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /select-vendor
+    ui_trigger: "reached via / redirect for multi-vendor namespaces with no current_vendor_id"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "select-vendor.html has onclick=\"selectVendor(id)\" buttons calling vendor.api.vendors.switch."
+
+  - id: vendor.web.dashboard
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /dashboard
+    ui_trigger: "main nav 'Dashboard'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["has_vendor_context() else redirect to /vendor/select-vendor (UX guard only, not an API-level control)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "Loads dashboard.js which fetches vendor.api.dashboard.metrics, vendor.api.vendors.context."
+
+  - id: vendor.web.invoices
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /invoices
+    ui_trigger: "main nav 'Invoices'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["has_vendor_context() page-level redirect guard"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "Backs invoice.js: list/create/update/reprocess flows and the FinDrive attachment picker."
+
+  - id: vendor.web.payments
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /payments
+    ui_trigger: "main nav 'Payments'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["has_vendor_context() page-level redirect guard"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: ""
+
+  - id: vendor.web.findrive
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /findrive
+    ui_trigger: "main nav 'FinDrive'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["has_vendor_context() page-level redirect guard"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "Backs findrive.js grid/upload UI, also opened as a modal picker from invoice.js and assistant.js."
+
+  - id: vendor.web.messages
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /messages
+    ui_trigger: "main nav 'Messages'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["has_vendor_context() page-level redirect guard"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: ""
+
+  - id: vendor.web.profile
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /profile
+    ui_trigger: "main nav 'Profile' / vendor-name menu"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["has_vendor_context() page-level redirect guard"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "profile.js drives update/delete/request-review actions."
+
+  - id: vendor.web.assistant
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /assistant
+    ui_trigger: "main nav 'AI Assistant' / chat bubble"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/web.py"}
+    notes: "Hosts assistant.js: the vendor chat UI over vendor.api.chat.send (SSE)."
+
+  # ---- Vendor / context API ----
+
+  - id: vendor.api.vendors.register
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/vendors/register
+    ui_trigger: "onboarding.html form -> onboarding.js:233 api.post(...)"
+    parameters:
+      - {name: body, location: body, type: object, required: true, source: "VendorRegistrationRequest{company_name,vendor_category,industry,services,name,email,phone?,tin,bank_account_number,bank_name,bank_routing_number,bank_account_holder_name}"}
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:89-151"}
+    notes: >
+      Creates a Vendor row scoped to session_context.namespace (VendorRepository.create_vendor,
+      repositories.py:282-318). Full bank details (account number, routing number, holder
+      name, TIN) accepted with only Pydantic type validation, no format/ownership check.
+      On success schedules a BackgroundTasks call to run_orchestrator_agent (agent_tool_call
+      realizing vendor.onboarding.evaluate — see l1_mcp.yaml / l2_semantic.yaml), and emits a
+      'vendor.created' business event.
+
+  - id: vendor.api.vendors.me
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/vendors/me
+    ui_trigger: null
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:154-163"}
+    notes: "Not called by current vendor JS (dashboard/profile use vendors/context instead) — reachable but unused by shipped UI."
+
+  - id: vendor.api.vendors.context
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/vendors/context
+    ui_trigger: "loaded first by dashboard.js:34, profile.js:50, findrive.js:70"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:166-175"}
+    notes: "Echoes session_context.current_vendor / available_vendors / is_multi_vendor_user() -> VendorContextResponse."
+
+  - id: vendor.api.vendors.get
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/vendors/{vendor_id}
+    ui_trigger: "profile.js:58"
+    parameters: [{name: vendor_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:178-196"}
+    notes: "get_vendor(vendor_id) is namespace-only; handler additionally 403s if vendor.id != current_vendor_id (api.py:191-194)."
+
+  - id: vendor.api.vendors.update
+    component: vendor
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/vendors/{vendor_id}
+    ui_trigger: "profile edit modal -> profile.js:381"
+    parameters:
+      - {name: vendor_id, location: path, type: integer, required: true, source: ""}
+      - {name: body, location: body, type: object, required: true, source: "VendorUpdateRequest{company_name?,services?,contact_name?,email?,phone?}"}
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:199-268"}
+    notes: "Schema deliberately excludes tin/bank fields/vendor_category — only settable at registration. current_vendor_id equality re-checked (api.py:215-218)."
+
+  - id: vendor.api.vendors.delete
+    component: vendor
+    interaction_type: http_route
+    method: DELETE
+    path: /api/v1/vendors/{vendor_id}
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:271-304"}
+    notes: "No call site in any shipped vendor JS — API-only, guarded identically to siblings (current_vendor_id check, api.py:285-288)."
+
+  - id: vendor.api.vendors.request_review
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/vendors/{vendor_id}/request-review
+    ui_trigger: "profile page 'Request Review' button -> profile.js:488"
+    parameters: [{name: vendor_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:307-366"}
+    notes: "Schedules run_orchestrator_agent background task re-running onboarding evaluation (Vendor Re-Review recipe)."
+
+  - id: vendor.api.vendors.switch
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/vendors/switch/{vendor_id}
+    ui_trigger: "vendor-switcher dropdown (dashboard.js:88), select-vendor.html onclick"
+    parameters: [{name: vendor_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "vendor_id must belong to caller's own namespace"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:369-409; finbot/core/auth/session.py:770-806"}
+    notes: "update_vendor_context does a GLOBAL UPDATE of current_vendor_id across every UserSession row for that user_id — every open tab/device switches vendor simultaneously."
+
+  # ---- Dashboard / invoices / payments ----
+
+  - id: vendor.api.dashboard.metrics
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/dashboard/metrics
+    ui_trigger: "dashboard.js:217, profile.js:62, invoice.js:56 on page load"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["current_vendor_id set (unhandled ValueError -> 500 if not, for the invoice-stats sub-call)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:413-498"}
+    notes: "Aggregates InvoiceRepository/EmailRepository/PaymentTransactionRepository/FinDriveFileRepository, all correctly parameterized by current_vendor_id."
+
+  - id: vendor.api.invoices.list
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/invoices
+    ui_trigger: "payments.js:38, invoice.js:343 (raw fetch, bypasses shared api.js CSRF-attach helper — harmless since GET is CSRF-exempt anyway)"
+    parameters: [{name: status, location: query, type: string, required: false, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["current_vendor_id set (raises ValueError -> unhandled 500 if not — inconsistent with payments' clean 400)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:502-528; finbot/core/data/repositories.py:394-407"}
+    notes: "list_invoices_for_current_vendor filters Invoice.vendor_id == current_vendor_id — correctly scoped."
+
+  - id: vendor.api.invoices.create
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/invoices
+    ui_trigger: "Invoices page 'New Invoice' form -> invoice.js:305"
+    parameters:
+      - {name: body, location: body, type: object, required: true, source: "InvoiceCreateRequest{invoice_number,amount,description,invoice_date,due_date,attachments?:[AttachmentRef]}"}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "current_vendor_id set"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:531-605"}
+    notes: >
+      create_invoice_for_current_vendor forces vendor_id=current_vendor_id server-side —
+      client cannot set an arbitrary vendor_id (no such field in the request model).
+      attachments[].file_id values are NOT validated against FinDrive at submission time —
+      stored as-is in Invoice.attachments JSON and forwarded to the background
+      run_orchestrator_agent call as task_data["attachment_file_ids"]; ownership/existence is
+      resolved later, only if/when the downstream InvoiceAgent calls findrive__get_file.
+
+  - id: vendor.api.invoices.get
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/invoices/{invoice_id}
+    ui_trigger: "invoice detail modal -> invoice.js:889,904"
+    parameters: [{name: invoice_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:608-625; finbot/core/data/repositories.py:564-568"}
+    notes: "get_invoice() is namespace-only by repository docstring ('validates namespace, not vendor'); handler adds explicit vendor_id != current_vendor_id 403 check (api.py:622-623)."
+
+  - id: vendor.api.invoices.update
+    component: vendor
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/invoices/{invoice_id}
+    ui_trigger: "invoice.js:298"
+    parameters:
+      - {name: invoice_id, location: path, type: integer, required: true, source: ""}
+      - {name: body, location: body, type: object, required: true, source: "InvoiceUpdateRequest{invoice_number?,amount?,description?,invoice_date?,due_date?,attachments?}"}
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:639-697"}
+    notes: "status field deliberately excluded from the request model ('status not editable by vendors') — nothing to bypass at the Pydantic layer for this route."
+
+  - id: vendor.api.invoices.reprocess
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/invoices/{invoice_id}/reprocess
+    ui_trigger: "invoice detail modal 'Reprocess' button -> invoice.js:608"
+    parameters: [{name: invoice_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:700-758"}
+    notes: "Schedules run_orchestrator_agent background task re-running InvoiceAgent (Invoice Reprocessing recipe)."
+
+  - id: vendor.api.payments.summary
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/payments/summary
+    ui_trigger: "payments.js:65"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["current_vendor_id set (explicit 400 'Vendor context required' otherwise)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:766-801"}
+    notes: "PaymentTransactionRepository.list_for_vendor(current_vendor_id) — correctly scoped."
+
+  - id: vendor.api.payments.transactions
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/payments/transactions
+    ui_trigger: "payments.js:105"
+    parameters:
+      - {name: limit, location: query, type: integer, required: false, source: ""}
+      - {name: offset, location: query, type: integer, required: false, source: ""}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["current_vendor_id set (explicit 400 otherwise)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:804-826"}
+    notes: ""
+
+  # ---- FinDrive ----
+
+  - id: vendor.api.findrive.list
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/findrive
+    ui_trigger: "findrive.js:104 list view; also the file picker used by invoice.js:935 and assistant.js:368"
+    parameters: [{name: limit, location: query, type: integer, required: false, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["current_vendor_id set"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:846-865"}
+    notes: "vendor_id=current_vendor_id passed directly into FinDriveFileRepository.list_files — correctly scoped, so the picker only ever shows the current vendor's own files."
+
+  - id: vendor.api.findrive.create
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/findrive
+    ui_trigger: "findrive.js:297 'New File' form"
+    parameters: [{name: body, location: body, type: object, required: true, source: "FileCreateRequest{filename,content,folder?,file_type?}"}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "current_vendor_id set"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:868-892"}
+    notes: >
+      Calls FinDriveFileRepository.create_file directly, BYPASSING the MCP findrive__upload_file
+      tool entirely — so the 500KB max_file_size_kb cap enforced only inside the MCP tool
+      (finbot/mcp/servers/findrive/server.py:58-60) does not apply to files created via this
+      REST route. content is stored as plain text (no binary/base64 handling anywhere).
+
+  - id: vendor.api.findrive.get
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/findrive/{file_id}
+    ui_trigger: "findrive.js:314,345"
+    parameters: [{name: file_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:895-915"}
+    notes: "repo.get_file(file_id) is namespace-only; handler adds vendor_id != current_vendor_id 403 (api.py:912-913). The MCP findrive server's own get_file tool does NOT apply this same current-vendor check (see l1_mcp.yaml mcp.findrive.get_file) — REST and MCP paths to the same table enforce different scopes."
+
+  - id: vendor.api.findrive.update
+    component: vendor
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/findrive/{file_id}
+    ui_trigger: "findrive.js:294"
+    parameters:
+      - {name: file_id, location: path, type: integer, required: true, source: ""}
+      - {name: body, location: body, type: object, required: true, source: "FileUpdateRequest{filename?,content?}"}
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:918-945"}
+    notes: "Same current_vendor_id equality pattern (api.py:936-937)."
+
+  - id: vendor.api.findrive.delete
+    component: vendor
+    interaction_type: http_route
+    method: DELETE
+    path: /api/v1/findrive/{file_id}
+    ui_trigger: "findrive.js:372"
+    parameters: [{name: file_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:948-970"}
+    notes: "Same current_vendor_id equality pattern (api.py:965-966)."
+
+  # ---- Messages ----
+
+  - id: vendor.api.messages.list
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages
+    ui_trigger: "messages.js:69"
+    parameters:
+      - {name: message_type, location: query, type: string, required: false, source: ""}
+      - {name: is_read, location: query, type: boolean, required: false, source: ""}
+      - {name: limit, location: query, type: integer, required: false, source: ""}
+      - {name: offset, location: query, type: integer, required: false, source: ""}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:978-1006"}
+    notes: "vendor_id=current_vendor_id passed explicitly into EmailRepository — correctly scoped."
+
+  - id: vendor.api.messages.stats
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages/stats
+    ui_trigger: null
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1009-1019"}
+    notes: ""
+
+  - id: vendor.api.messages.contacts
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages/contacts
+    ui_trigger: "messages.js:312 compose autocomplete"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1022-1039"}
+    notes: "By design lists every vendor's name/email in the namespace as a directory — cross-vendor-within-namespace, intentional (compose autocomplete)."
+
+  - id: vendor.api.messages.get
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages/{message_id}
+    ui_trigger: null
+    parameters: [{name: message_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1042-1058"}
+    notes: "get_email() namespace-only; handler adds vendor_id != current_vendor_id 403."
+
+  - id: vendor.api.messages.read
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/messages/{message_id}/read
+    ui_trigger: "messages.js:215"
+    parameters: [{name: message_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1061-1078"}
+    notes: ""
+
+  - id: vendor.api.messages.read_all
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/messages/read-all
+    ui_trigger: "messages.js:235"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1081-1092"}
+    notes: ""
+
+  - id: vendor.api.messages.send
+    component: vendor
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/messages/send
+    ui_trigger: "messages.js:407 compose form"
+    parameters: [{name: body, location: body, type: object, required: true, source: "ComposeEmailRequest{to:[],subject,body,message_type?,cc?,bcc?}"}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1095-1154"}
+    notes: >
+      from_addr forced server-side from the current vendor's own email (cannot spoof sender).
+      to/cc/bcc are free-form and passed to finmail.routing.route_and_deliver, which resolves
+      each address to vendor/admin/internal/external inbox_type. Recipients that resolve to
+      "external" trigger an 'email.external_delivery' business event and land in that
+      namespace's CTF Dead Drop view (see l2_semantic.yaml).
+
+  # ---- Chat ----
+
+  - id: vendor.api.chat.send
+    component: vendor
+    interaction_type: sse_stream
+    method: POST
+    path: /api/v1/chat
+    ui_trigger: "assistant.js:236 chat input send button"
+    parameters: [{name: body, location: body, type: object, required: true, source: "ChatRequest{message:str, attachments?:[AttachmentRef{file_id,filename,file_type}]}"}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required (POST)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence:
+      source_ref: "finbot/apps/vendor/routes/api.py:1169-1196"
+      black_box: "OpenAPI lists this as a plain POST returning 200/422; live source shows StreamingResponse(media_type='text/event-stream') — a black-box client relying only on the OpenAPI schema would miscategorize this as a normal JSON endpoint."
+    notes: >
+      Realizes finbot.agent_tool_call records in l1_mcp.yaml (VendorChatAssistant loop).
+      No current_vendor_id precondition on the endpoint itself — chat works even with no
+      vendor selected (history then keys off vendor_id IS NULL). See l2_semantic.yaml for
+      the full agent/tool/MCP data-flow this endpoint realizes.
+
+  - id: vendor.api.chat.history_get
+    component: vendor
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/chat/history
+    ui_trigger: "assistant.js:78 on page load"
+    parameters: [{name: limit, location: query, type: integer, required: false, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1199-1208"}
+    notes: "ChatMessageRepository scoped by namespace+user_id+vendor_id (repositories.py:758-761) — correctly isolated per vendor context."
+
+  - id: vendor.api.chat.history_clear
+    component: vendor
+    interaction_type: http_route
+    method: DELETE
+    path: /api/v1/chat/history
+    ui_trigger: "assistant.js:321 'Clear' button"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/vendor/routes/api.py:1211-1219"}
+    notes: ""

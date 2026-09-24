@@ -26,16 +26,6 @@ fields:
       mounted when CC_ENABLED, and returns 403 site-wide when reached
       without the required grant).
 
-  direction:
-    status: added
-    type: enum [entry, exit, bidirectional]
-    desc: >
-      ASA distinguishes "entry points" and "exit points" but treats them as
-      separate catalogs. In an agentic app the same MCP tool can be an exit
-      point in one context (e.g. systemutils.network_request used as an
-      exfil channel) and effectively unreachable directly by a human in
-      another. Kept as a single field per item rather than two catalogs so
-      L1 stays one flat list.
 
   interaction_type:
     status: modified

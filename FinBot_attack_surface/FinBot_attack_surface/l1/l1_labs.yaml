@@ -1,0 +1,189 @@
+# L1 — labs sub-app (finbot/apps/labs/**, mounted at /labs)
+# Schema: FinBot_attack_surface/schema/L1_schema.yaml
+# component = "labs" for all records. Live-confirmed via /labs/openapi.json (8 paths, 2026-09-19).
+#
+# This app is the guardrail-webhook research feature: a per-(namespace, user_id) config
+# that lets a user register an outbound webhook to be notified around every
+# model/tool call the agent framework makes. It is genuine application attack surface
+# (an SSRF-relevant outbound-webhook feature + a passive security-hook design), not part
+# of the CTF scoring wrapper.
+#
+# Cross-cutting facts:
+#   - All routes use get_session_context (any session, temp or permanent).
+#   - LabsGuardrailConfig is scoped by (namespace, user_id) — one config per identity,
+#     shared across whichever portal (vendor/admin) that identity's agents run under.
+#   - Non-GET routes require the CSRF header (no /labs/ exemption in csrf.py).
+
+records:
+  - id: labs.web.home
+    component: labs
+    interaction_type: http_route
+    method: GET
+    path: /
+    ui_trigger: "browser navigation to /labs/"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 307 -> /labs/, live"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/web.py:15-19"}
+    notes: "Redirects to /labs/guardrails."
+
+  - id: labs.web.guardrails
+    component: labs
+    interaction_type: http_route
+    method: GET
+    path: /guardrails
+    ui_trigger: "labs nav 'Guardrails'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/web.py:22-27"}
+    notes: "guardrails.html — config form for webhook_url, hooks, timeout_seconds, enabled."
+
+  - id: labs.web.guardrails_activity
+    component: labs
+    interaction_type: http_route
+    method: GET
+    path: /guardrails/activity
+    ui_trigger: "labs nav 'Activity'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/web.py:30-37"}
+    notes: ""
+
+  - id: labs.api.guardrails.get_config
+    component: labs
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/guardrails
+    ui_trigger: "guardrails.html loadConfig()"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:45-57"}
+    notes: "LabsGuardrailConfigRepository.get_for_current_user filters (namespace, user_id). Returns null if no config saved yet."
+
+  - id: labs.api.guardrails.upsert_config
+    component: labs
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/guardrails
+    ui_trigger: "'Save Configuration' submit"
+    parameters:
+      - {name: body, location: body, type: object, required: true, source: "GuardrailConfigRequest{webhook_url:str[R], hooks?:dict[str,bool], timeout_seconds?:int, enabled?:bool}"}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "webhook_url passes validate_webhook_url SSRF guard"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:60-80; finbot/core/data/repositories.py:1297-1344"}
+    notes: >
+      First save auto-generates signing_secret (used later to HMAC-sign outbound hook
+      payloads). validate_webhook_url requires http/https + a hostname; outside DEBUG it
+      blocks localhost, metadata.google.internal, and RFC1918/loopback/link-local ranges,
+      and restricts non-80/443 ports to 1024-65535 — an explicit SSRF-hardening
+      precondition on this outbound-webhook feature. hooks dict keys are validated against
+      VALID_HOOK_KINDS = {before_model, after_model, before_tool, after_tool}; unknown keys
+      -> 422.
+
+  - id: labs.api.guardrails.toggle_enabled
+    component: labs
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/guardrails/toggle
+    ui_trigger: "'Enable/Disable' toggle button"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "config row must already exist (404 otherwise)"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:83-97"}
+    notes: ""
+
+  - id: labs.api.guardrails.rotate_secret
+    component: labs
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/guardrails/rotate-secret
+    ui_trigger: "'Rotate Secret' button"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "config row must already exist"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:100-114"}
+    notes: "Regenerates signing_secret used to HMAC-sign the X-Guardrail-Signature header on outbound hook POSTs."
+
+  - id: labs.api.guardrails.delete_config
+    component: labs
+    interaction_type: http_route
+    method: DELETE
+    path: /api/v1/guardrails
+    ui_trigger: "'Delete' button"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "config row must already exist"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:117-129"}
+    notes: ""
+
+  - id: labs.api.guardrails.test_webhook
+    component: labs
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/guardrails/test
+    ui_trigger: "'Send Test Hook' button"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["a saved+enabled config with the before_tool hook toggled on, else short-circuits to no_config/hook_disabled with no outbound call"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:131-148"}
+    notes: >
+      Fires GuardrailHookService.invoke(HookKind.before_tool, tool_name='test_tool',
+      tool_source='native', tool_arguments={'example_param':'hello_from_labs'}) — exercises
+      the exact same envelope/HMAC-signing/HTTP-POST path as a real agent-triggered hook,
+      with synthetic data. Result is not persisted as chat/tool history; only the resulting
+      guardrail-outcome event is logged.
+
+  - id: labs.api.guardrails.get_activity
+    component: labs
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/guardrails/activity
+    ui_trigger: "/labs/guardrails/activity page"
+    parameters: [{name: limit, location: query, type: integer, required: false, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/labs/routes/guardrails.py:151-165"}
+    notes: "Namespace-scoped event query filtered to agent_name=='guardrail' — a log of every hook firing (outcome/verdict/latency/tool) for this identity's agent activity, across whichever portal triggered it."

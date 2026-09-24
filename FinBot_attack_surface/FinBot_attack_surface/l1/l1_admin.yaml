@@ -1,0 +1,450 @@
+# L1 — admin sub-app (finbot/apps/admin/**, mounted at /admin)
+# Schema: FinBot_attack_surface/schema/L1_schema.yaml
+# component = "admin" for all records. Live-confirmed via /admin/openapi.json (22 paths, 2026-09-19).
+#
+# Cross-cutting fact that dominates this whole file:
+#   There is NO authentication or role-based authorization boundary between the vendor
+#   portal and the admin portal. Every admin route (web and API) depends on
+#   get_session_context (finbot/core/auth/middleware.py:156-161) — identical to every
+#   vendor route. portal_type="admin" is set purely because the request path starts with
+#   "/admin" (finbot/core/auth/middleware.py:44-47) — it is a UI label, not a credential.
+#   session_context.is_admin_portal() (session.py:150-151) just re-reads that label.
+#   An anonymous, never-authenticated temporary session that simply navigates to
+#   /admin/dashboard gets full admin-portal access. Data scoping is by namespace (one
+#   per browser/session identity), so "admin view" means "everything created under this
+#   one session's own namespace," not a cross-tenant view of other players' data.
+#   auth_requirement is therefore "session:temporary" and authz_check_location "none"
+#   for every record below unless a stronger in-handler/repository check is noted.
+
+records:
+  - id: admin.web.home
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /
+    ui_trigger: "browser navigation to /admin/"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 307 -> /admin/, live"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:15-19"}
+    notes: "302-redirects to /admin/dashboard."
+
+  - id: admin.web.dashboard
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /dashboard
+    ui_trigger: "main admin nav 'Dashboard'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:22-30"}
+    notes: "Hosts the Finance Co-Pilot chat widget (js/admin/copilot.js) over admin.api.copilot.chat."
+
+  - id: admin.web.messages
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /messages
+    ui_trigger: "admin nav 'Messages'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:33-41"}
+    notes: ""
+
+  - id: admin.web.findrive
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /findrive
+    ui_trigger: "admin nav 'FinDrive'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:45-53"}
+    notes: ""
+
+  - id: admin.web.mcp_servers
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /mcp-servers
+    ui_trigger: "admin nav 'MCP Servers'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:56-64"}
+    notes: ""
+
+  - id: admin.web.mcp_config
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /mcp-servers/{server_type}
+    ui_trigger: "'Configure' button on the MCP Servers list"
+    parameters: [{name: server_type, location: path, type: string, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:67-79"}
+    notes: ""
+
+  - id: admin.web.mcp_activity
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /mcp-activity
+    ui_trigger: "admin nav 'MCP Activity'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/web.py:82-90"}
+    notes: ""
+
+  # ---- Finance Co-Pilot chat ----
+
+  - id: admin.api.copilot.chat
+    component: admin
+    interaction_type: sse_stream
+    method: POST
+    path: /api/v1/copilot/chat
+    ui_trigger: "dashboard.html chat box -> copilot.js:415"
+    parameters: [{name: body, location: body, type: object, required: true, source: "ChatRequest{message:str}"}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:501-522"}
+    notes: >
+      Instantiates CoPilotAssistant (finbot/agents/chat.py:731-1141), streamed as SSE.
+      Unlike vendor.api.chat.send, no attachments field on the request model and no
+      current_vendor_id requirement. See l2_semantic.yaml for the full tool/data-access
+      trace (cross-vendor summary tools, FinDrive/FinMail full-access mode).
+
+  - id: admin.api.copilot.history_get
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/copilot/history
+    ui_trigger: "copilot.js:297 on page load"
+    parameters: [{name: limit, location: query, type: integer, required: false, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:525-534"}
+    notes: "ChatMessageRepository filters vendor_id IS NULL (admin sessions never get current_vendor_id populated) — same chat_messages table vendor chat uses, disjoint by that column."
+
+  - id: admin.api.copilot.history_clear
+    component: admin
+    interaction_type: http_route
+    method: DELETE
+    path: /api/v1/copilot/history
+    ui_trigger: "copilot.js:498 'clear chat' action"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:537-545"}
+    notes: "Soft-delete via cleared_at."
+
+  # ---- MCP server management (operational config only — NOT tool-description overrides) ----
+
+  - id: admin.api.mcp.list_servers
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/mcp/servers
+    ui_trigger: "mcp-servers.js:14"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:85-122"}
+    notes: "Seeds MCPServerConfig rows per namespace from MCP_SERVER_DEFAULTS on first call. server_type universe: finstripe, findrive, taxcalc, systemutils, finmail (api.py:33,41,49,57,65)."
+
+  - id: admin.api.mcp.get_server
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/mcp/servers/{server_type}
+    ui_trigger: "mcp-config.js:18 on config-page load"
+    parameters: [{name: server_type, location: path, type: string, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:125-154"}
+    notes: "Also returns default_tools via a dummy-namespace FastMCP introspection (_get_default_tool_definitions, api.py:463-488), independent of any per-user config."
+
+  - id: admin.api.mcp.update_server_config
+    component: admin
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/mcp/servers/{server_type}
+    ui_trigger: "mcp-config.html 'Save Settings' button -> mcp-config.js:158"
+    parameters:
+      - {name: server_type, location: path, type: string, required: true, source: ""}
+      - {name: body, location: body, type: object, required: true, source: "ServerConfigUpdate{config:object}"}
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:157-171; finbot/core/data/repositories.py:642-651"}
+    notes: >
+      Writes MCPServerConfig.config_json only (plain operational parameters like
+      max_payment, max_file_size_kb, tax_rates, mock_hostname, max_results_per_query —
+      see l1_mcp.yaml for the full per-server config surface). CANNOT touch
+      tool_overrides_json — a dead comment at api.py:174 notes "Tool definition overrides
+      have moved to Dark Lab (/darklab/supply-chain)". Config changes apply to every
+      consumer of that namespace's MCP server (vendor chat, admin Co-Pilot, orchestrator/
+      specialized agents) on their next create_mcp_server() call.
+
+  - id: admin.api.mcp.toggle_server
+    component: admin
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/mcp/servers/{server_type}/toggle
+    ui_trigger: "toggle button on mcp-config.js:117 and mcp-servers.js:97"
+    parameters: [{name: server_type, location: path, type: string, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:177-190"}
+    notes: "Disabling a server makes finbot/mcp/factory.py:88-95 refuse to instantiate it for that namespace's agents entirely (create_mcp_server returns None)."
+
+  - id: admin.api.mcp.list_activity
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/mcp/activity
+    ui_trigger: "mcp-activity.js:22-26"
+    parameters:
+      - {name: server_type, location: query, type: string, required: false, source: ""}
+      - {name: workflow_id, location: query, type: string, required: false, source: ""}
+      - {name: limit, location: query, type: integer, required: false, source: ""}
+      - {name: offset, location: query, type: integer, required: false, source: ""}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:406-429; finbot/core/data/repositories.py:716-743"}
+    notes: >
+      Reads mcp_activity_log rows written synchronously by MCPToolProvider._log_activity
+      (finbot/mcp/provider.py:281-304) on every tools/list and tools/call — full tool-call
+      arguments logged verbatim, result/error truncated to 1000 chars. Namespace-scoped
+      only (not restricted to admin-originated calls) — a vendor chat session's MCP tool
+      calls in the same namespace also appear here.
+
+  # ---- Messages (admin inbox) ----
+
+  - id: admin.api.messages.list
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages
+    ui_trigger: "messages.js:69"
+    parameters:
+      - {name: message_type, location: query, type: string, required: false, source: ""}
+      - {name: is_read, location: query, type: boolean, required: false, source: ""}
+      - {name: limit, location: query, type: integer, required: false, source: ""}
+      - {name: offset, location: query, type: integer, required: false, source: ""}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:198-221"}
+    notes: "EmailRepository.list_admin_emails filters inbox_type=='admin', namespace-scoped — correctly restricted to the admin-inbox subset."
+
+  - id: admin.api.messages.stats
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages/stats
+    ui_trigger: null
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:224-231"}
+    notes: ""
+
+  - id: admin.api.messages.contacts
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages/contacts
+    ui_trigger: "compose autocomplete"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:234-251"}
+    notes: "Lists every vendor in namespace plus the namespace's admin address — same logic as vendor.api.messages.contacts."
+
+  - id: admin.api.messages.get
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/messages/{message_id}
+    ui_trigger: null
+    parameters: [{name: message_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:254-267"}
+    notes: >
+      get_email(message_id) filters by namespace only — no inbox_type check, unlike the
+      list endpoint (which filters inbox_type=='admin') and unlike vendor's by-ID sibling
+      (which adds a vendor_id==current_vendor_id check). This by-ID route will return any
+      email row in the namespace regardless of inbox_type. Documented as an internal
+      scoping inconsistency between admin's own list vs. by-ID handlers.
+
+  - id: admin.api.messages.read
+    component: admin
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/messages/{message_id}/read
+    ui_trigger: "messages.js:246"
+    parameters: [{name: message_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:270-284"}
+    notes: "Same namespace-only scoping gap as admin.api.messages.get (no inbox_type check)."
+
+  - id: admin.api.messages.read_all
+    component: admin
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/messages/read-all
+    ui_trigger: "messages.js:264"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:287-296"}
+    notes: "mark_all_admin_as_read — correctly scoped to inbox_type=='admin'."
+
+  - id: admin.api.messages.send
+    component: admin
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/messages/send
+    ui_trigger: "messages.js:399 compose form"
+    parameters: [{name: body, location: body, type: object, required: true, source: "ComposeEmailRequest{to:[],subject,body,message_type?,cc?,bcc?}"}]
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:309-355"}
+    notes: "route_and_deliver(sender_type='admin', from_address=get_admin_address(namespace)). Structurally identical to vendor.api.messages.send."
+
+  # ---- FinDrive (admin-scoped files) ----
+
+  - id: admin.api.findrive.list
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/findrive
+    ui_trigger: "findrive.js:61"
+    parameters:
+      - {name: folder, location: query, type: string, required: false, source: ""}
+      - {name: file_type, location: query, type: string, required: false, source: ""}
+      - {name: limit, location: query, type: integer, required: false, source: ""}
+    auth_requirement: session:temporary
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:363-382"}
+    notes: "list_files() is namespace-scoped only; handler filters IN CODE for vendor_id is None (admin-scoped files, e.g. saved Co-Pilot reports) plus optional file_type — filtering happens after fetch (in_handler), whereas vendor's equivalent passes vendor_id into the query itself (repository_layer)."
+
+  - id: admin.api.findrive.get
+    component: admin
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/findrive/{file_id}
+    ui_trigger: "findrive.js:173"
+    parameters: [{name: file_id, location: path, type: integer, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/admin/routes/api.py:385-398"}
+    notes: >
+      get_file(file_id) is namespace-only — NO vendor_id-is-None check at all, unlike the
+      list endpoint's in-handler filter and unlike vendor's by-ID sibling (which 403s on
+      vendor_id != current_vendor_id). Any file id in the namespace — including
+      vendor-owned invoice/compliance documents — is returned, despite the docstring
+      describing it as fetching "an admin file's content." Same list-vs-by-ID scoping gap
+      pattern observed in the messages endpoints above.

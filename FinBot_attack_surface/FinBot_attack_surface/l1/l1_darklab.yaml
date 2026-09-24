@@ -1,0 +1,174 @@
+# L1 — darklab sub-app (finbot/apps/darklab/**, mounted at /darklab)
+# Schema: FinBot_attack_surface/schema/L1_schema.yaml
+# component = "darklab" for all records. Live-confirmed via /darklab/openapi.json (15 paths, 2026-09-19).
+#
+# Scope note: this file excludes /api/v1/toolkit/dead-drop and /api/v1/toolkit/exfil-data,
+# which darklab also mounts (finbot/apps/darklab/routes/api.py:215-375) — these are the
+# CTF "Hacker Toolkit" views (its own module docstring: "surfaces exfiltrated data for CTF
+# scenarios"), read-only observability over data produced elsewhere, and are out of scope
+# per the CTF-game exclusion. Darklab's own reason for being — the MCP supply-chain
+# tool-override mechanism — is genuine application attack surface (a real feature of the
+# vulnerable platform, not a scoring wrapper) and is fully covered below.
+#
+# Cross-cutting facts:
+#   - All routes use get_session_context (any session, temp or permanent) — no login
+#     required. Isolation is by session_context.namespace only (one per browser/session
+#     identity), the same identity boundary /vendor and /admin use.
+#   - MCPServerConfig (the table these routes read/write) is namespace-scoped and is the
+#     SAME table + repository the admin app's /admin/api/v1/mcp/servers/* endpoints use
+#     (see l1_admin.yaml admin.api.mcp.*) — darklab writes tool_overrides_json, admin
+#     writes config_json, on the same per-(namespace, server_type) row.
+#   - Non-GET routes require the CSRF header (no /darklab/ exemption in csrf.py).
+
+records:
+  - id: darklab.web.home
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /
+    ui_trigger: "browser navigation to /darklab/"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 307 -> /darklab/, live"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/web.py:15-19"}
+    notes: ""
+
+  - id: darklab.web.dashboard
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /dashboard
+    ui_trigger: "darklab nav 'Dashboard'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/web.py:22-30"}
+    notes: ""
+
+  - id: darklab.web.supply_chain
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /supply-chain
+    ui_trigger: "darklab nav 'Supply Chain'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/web.py:33-41"}
+    notes: "Loads static/js/darklab/supply-chain.js, the UI for the tool-override mechanism below."
+
+  - id: darklab.api.supply_chain.list_servers
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/supply-chain/servers
+    ui_trigger: "supply-chain.html loadServers()"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/api.py:40-72"}
+    notes: "Lists every MCPServerConfig row for the namespace plus each server's live default tool catalog (name/description/schema) introspected via a dummy FastMCP instance."
+
+  - id: darklab.api.supply_chain.get_server_tools
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/supply-chain/servers/{server_type}
+    ui_trigger: null
+    parameters: [{name: server_type, location: path, type: string, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["server_type must be one of finstripe/findrive/taxcalc/systemutils/finmail, else 404"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/api.py:75-104"}
+    notes: "Detail fetch for one server; not directly wired to a button in the current UI (list view shows all servers already)."
+
+  - id: darklab.api.supply_chain.update_tool_overrides
+    component: darklab
+    interaction_type: http_route
+    method: PUT
+    path: /api/v1/supply-chain/servers/{server_type}/tools
+    ui_trigger: "'Save' button per server card -> supply-chain.js:200-219 saveServerOverrides()"
+    parameters:
+      - {name: server_type, location: path, type: string, required: true, source: ""}
+      - {name: body, location: body, type: object, required: true, source: "ToolOverridesUpdate{tool_overrides: dict[str, dict]} — UI only ever sends {tool_name: {description: str}}"}
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required", "server_type config row must already exist"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/api.py:107-126; finbot/core/data/repositories.py:653"}
+    notes: >
+      THE core mechanism: writes MCPServerConfig.tool_overrides_json for the caller's own
+      namespace. Although the API/DB will store an arbitrary per-tool JSON object, only the
+      "description" key is ever read back and applied (finbot/mcp/factory.py:51-57,
+      _apply_tool_overrides) — argument-schema overrides are stored but never enacted.
+      Effect realized at the next create_mcp_server() call for that (namespace, server_type)
+      — see l1_mcp.yaml and l2_semantic.yaml for how this reaches the LLM's tool catalog.
+
+  - id: darklab.api.supply_chain.reset_tool_overrides
+    component: darklab
+    interaction_type: http_route
+    method: POST
+    path: /api/v1/supply-chain/servers/{server_type}/reset-tools
+    ui_trigger: "'Reset All' button (with confirm modal) -> supply-chain.js resetServerOverrides()"
+    parameters: [{name: server_type, location: path, type: string, required: true, source: ""}]
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: ["CSRF header required"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: true, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/api.py:129-140; finbot/core/data/repositories.py:673"}
+    notes: "Clears tool_overrides_json back to empty for that (namespace, server_type)."
+
+  - id: darklab.api.supply_chain.stats
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/supply-chain/stats
+    ui_trigger: "dashboard widget"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/api.py:143-155"}
+    notes: "Aggregate count of active tool overrides across the namespace's MCP servers."
+
+  - id: darklab.web.toolkit
+    component: darklab
+    interaction_type: http_route
+    method: GET
+    path: /toolkit
+    ui_trigger: "darklab nav 'Toolkit'"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/darklab/routes/web.py:44-52"}
+    notes: "Page shell only — the underlying dead-drop/exfil-data API it calls is the CTF Hacker Toolkit and is out of scope for this dataset (see file header)."

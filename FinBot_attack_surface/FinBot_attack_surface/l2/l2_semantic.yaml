@@ -1,0 +1,1206 @@
+# L2 — semantic/stateful attack surface: business-meaningful operations realized by
+# one or more L1 interactions (FinBot_attack_surface/l1/*.yaml).
+# Schema: FinBot_attack_surface/schema/L2_schema.yaml
+#
+# Scope note: as with the L1 dataset, this excludes the CTF scoring/game layer
+# (challenges, badges, points, detectors, evaluators, the "Hacker Toolkit" dead-drop/
+# exfil views) — operations below are described purely in terms of the underlying
+# FinBot vendor-management application's own state and observable signals (DB rows,
+# emails, tool calls, UI state, event_bus emissions consumed by its live-activity/
+# WebSocket feed), not in terms of any scoring/detection outcome.
+#
+# All namespace isolation referenced below means: finbot/core/data/repositories.py:30-45
+# (NamespacedRepository), where namespace = f"ns_user_{user_id}" is fixed 1:1 to whichever
+# browser/session identity is acting (finbot/core/auth/session.py:230-240) — the same
+# identity is shared across /vendor, /admin, /darklab, /labs for a given signed-in (or
+# anonymous) user.
+
+records:
+  # =========================================================================
+  # Vendor lifecycle
+  # =========================================================================
+
+  - id: vendor.onboard_new_vendor
+    semantic_operation: "Register a new vendor profile and have it autonomously evaluated for status/trust/risk"
+    business_objects: [Vendor, AgentSession]
+    realizing_l1_ids:
+      - vendor.api.vendors.register
+      - agent.orchestrator.delegate_to_onboarding
+      - agent.onboarding.get_vendor_details
+      - agent.onboarding.update_vendor_status
+      - agent.orchestrator.delegate_to_fraud
+      - agent.fraud.get_vendor_risk_profile
+      - agent.fraud.update_vendor_risk
+      - agent.orchestrator.delegate_to_communication
+      - agent.communication.get_vendor_contact_info
+      - mcp.finmail.send_email
+    parameter_flow:
+      - from: {component: vendor, l1_id: vendor.api.vendors.register, parameter: "body.company_name"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.company_name"}
+        transformation: "written verbatim via VendorRepository.create_vendor (repositories.py:282-318); Pydantic-type-only validation"
+      - from: {component: vendor, l1_id: vendor.api.vendors.register, parameter: "body.email"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.email"}
+        transformation: "unchanged; becomes the sole delivery address for the eventual decision-notification email (hop 19-20)"
+      - from: {component: vendor, l1_id: vendor.api.vendors.register, parameter: "body.services"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.services"}
+        transformation: "unchanged, stored as free text"
+      - from: {component: vendor, l1_id: vendor.api.vendors.register, parameter: "body.tin, body.bank_account_number, body.bank_name, body.bank_routing_number, body.bank_account_holder_name"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.tin, Vendor.bank_*"}
+        transformation: "written verbatim, Pydantic-type-only validation; not re-read by any hop in this onboarding decision path"
+      - from: {component: vendor, l1_id: vendor.api.vendors.register, parameter: "Vendor.id (server-generated on insert)"}
+        to: {component: agent, l1_id: agent.orchestrator.delegate_to_onboarding, parameter: "vendor_id"}
+        transformation: "passed as task_data['vendor_id'] to the BackgroundTasks run_orchestrator_agent call (api.py:118-126); the orchestrator LLM echoes this same id as the vendor_id argument when it decides to call delegate_to_onboarding"
+      - from: {component: agent, l1_id: agent.orchestrator.delegate_to_onboarding, parameter: "vendor_id"}
+        to: {component: agent, l1_id: agent.onboarding.get_vendor_details, parameter: "vendor_id"}
+        transformation: "forwarded into VendorOnboardingAgent's task_data (orchestrator.py:435-442); onboarding agent's own LLM chooses to call get_vendor_details with it"
+      - from: {component: vendor, l1_id: null, parameter: "Vendor.services, Vendor.agent_notes"}
+        to: {component: agent, l1_id: agent.onboarding.get_vendor_details, parameter: "response.services, response.agent_notes"}
+        transformation: "read back verbatim (onboarding.py:274-311)"
+      - from: {component: agent, l1_id: agent.onboarding.get_vendor_details, parameter: "response.services, response.agent_notes"}
+        to: {component: agent, l1_id: null, parameter: "onboarding agent user prompt (instruction channel)"}
+        transformation: "concatenated directly into the LLM user prompt by _get_user_prompt (onboarding.py:192-206) — untrusted vendor-supplied data mixed into the instruction channel, not passed as a tool-call argument"
+      - from: {component: agent, l1_id: null, parameter: "onboarding agent user prompt"}
+        to: {component: agent, l1_id: agent.onboarding.update_vendor_status, parameter: "status, trust_level, risk_level, agent_notes"}
+        transformation: "LLM's own decision, informed by (not deterministically derived from) the injected services/agent_notes text"
+      - from: {component: agent, l1_id: agent.onboarding.update_vendor_status, parameter: "vendor_id (unchanged from get_vendor_details hop)"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.status, Vendor.trust_level, Vendor.risk_level"}
+        transformation: "written via update_vendor_status tool function (tools/data/vendor.py); emits 'vendor.decision' business event"
+      - from: {component: agent, l1_id: agent.onboarding.update_vendor_status, parameter: "result.task_summary (from the onboarding sub-agent's own complete_task call)"}
+        to: {component: agent, l1_id: agent.orchestrator.delegate_to_fraud, parameter: "task_description"}
+        transformation: "appended as '[onboarding_agent]: <task_summary>' by _enrich_with_prior_context (orchestrator.py:403-416) before the orchestrator LLM composes the next delegate call — free text, not a structured field, crossing into the fraud agent's instruction channel"
+      - from: {component: agent, l1_id: agent.orchestrator.delegate_to_onboarding, parameter: "vendor_id"}
+        to: {component: agent, l1_id: agent.orchestrator.delegate_to_fraud, parameter: "vendor_id"}
+        transformation: "same vendor_id value, independently re-supplied as an argument by the orchestrator LLM (not structurally derived from onboarding's result)"
+      - from: {component: agent, l1_id: agent.orchestrator.delegate_to_fraud, parameter: "vendor_id"}
+        to: {component: agent, l1_id: agent.fraud.get_vendor_risk_profile, parameter: "vendor_id"}
+        transformation: "forwarded via FraudComplianceAgent's task_data (orchestrator.py:491-498); fraud agent's own LLM chooses to call get_vendor_risk_profile"
+      - from: {component: agent, l1_id: agent.fraud.get_vendor_risk_profile, parameter: "response (risk profile fields)"}
+        to: {component: agent, l1_id: agent.fraud.update_vendor_risk, parameter: "risk_level, agent_notes"}
+        transformation: "LLM's own risk assessment, informed by the retrieved profile plus the onboarding agent's task_summary injected in the preceding hop"
+      - from: {component: agent, l1_id: agent.fraud.update_vendor_risk, parameter: "vendor_id"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.risk_level"}
+        transformation: "written via update_vendor_risk tool function; emits 'fraud.vendor_risk_updated' business event (fraud.py:507-525) — overwrites the risk_level onboarding just set"
+      - from: {component: agent, l1_id: agent.fraud.update_vendor_risk, parameter: "result.task_summary"}
+        to: {component: agent, l1_id: agent.orchestrator.delegate_to_communication, parameter: "task_description"}
+        transformation: "same _enrich_with_prior_context chaining, now carrying both onboarding's and fraud's prior task_summary text"
+      - from: {component: agent, l1_id: agent.orchestrator.delegate_to_fraud, parameter: "vendor_id"}
+        to: {component: agent, l1_id: agent.orchestrator.delegate_to_communication, parameter: "vendor_id"}
+        transformation: "same vendor_id value, re-supplied as an argument by the orchestrator LLM"
+      - from: {component: agent, l1_id: agent.orchestrator.delegate_to_communication, parameter: "vendor_id"}
+        to: {component: agent, l1_id: agent.communication.get_vendor_contact_info, parameter: "vendor_id"}
+        transformation: "forwarded via CommunicationAgent's task_data (orchestrator.py:595-611); communication agent's own LLM chooses to call get_vendor_contact_info"
+      - from: {component: vendor, l1_id: null, parameter: "Vendor.email"}
+        to: {component: agent, l1_id: agent.communication.get_vendor_contact_info, parameter: "response.email"}
+        transformation: "read back verbatim (tools/data/vendor.py:34-53) — the vendor's own self-supplied registration email, never independently verified"
+      - from: {component: agent, l1_id: agent.communication.get_vendor_contact_info, parameter: "response.email"}
+        to: {component: agent, l1_id: mcp.finmail.send_email, parameter: "to"}
+        transformation: "LLM composes the send_email call using this address as the sole recipient — no allowlist or ownership re-check at this hop"
+      - from: {component: agent, l1_id: agent.onboarding.update_vendor_status, parameter: "status, trust_level, risk_level (plus fraud's risk_level)"}
+        to: {component: agent, l1_id: mcp.finmail.send_email, parameter: "subject, body"}
+        transformation: "LLM composes free-form notification text describing the decision — no structured template binds email content to the actual DB values"
+    preconditions: ["session:temporary is sufficient — no email binding or vendor-side credential required to submit a new vendor profile"]
+    effect_state_transition: >
+      Vendor row created (status='pending' by default) with fully user-supplied company/
+      contact/banking/TIN fields; background OrchestratorAgent runs the Vendor Onboarding
+      recipe (finbot/agents/orchestrator.py:105-113): VendorOnboardingAgent sets
+      status/trust_level/risk_level, then FraudComplianceAgent re-assesses risk (passed
+      the onboarding outcome verbatim via _enrich_with_prior_context), then
+      CommunicationAgent emails the vendor's own contact address with the decision.
+    observable_evidence:
+      - "Vendor.status/trust_level/risk_level change, visible on GET vendor.api.vendors.get / admin.api.findrive-adjacent vendor views"
+      - "'vendor.decision' and 'fraud.vendor_risk_updated' business events emitted (finbot/core/messaging/events.py)"
+      - "A new Email row (inbox_type='vendor') addressed to the vendor's own contact email"
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "fully reachable with an anonymous session — no auth required"}
+    source_ref: "finbot/apps/vendor/routes/api.py:89-151; finbot/agents/orchestrator.py:105-113,424-446"
+    notes: >
+      The onboarding decision is made entirely from data the registrant themselves
+      supplied moments earlier (company_name, services free-text, industry) — there is no
+      independent verification step before an LLM sets the vendor's initial trust/risk
+      posture.
+
+  - id: vendor.request_reevaluation
+    semantic_operation: "Ask the platform to re-run the onboarding/risk evaluation on an existing vendor"
+    business_objects: [Vendor]
+    realizing_l1_ids:
+      - vendor.api.vendors.request_review
+      - agent.orchestrator.delegate_to_onboarding
+      - agent.orchestrator.delegate_to_fraud
+      - agent.orchestrator.delegate_to_communication
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.vendors.request_review", parameter: "path.vendor_id"}
+        to: {component: vendor, l1_id: null, parameter: "session_context.current_vendor_id (equality check)"}
+        transformation: "authz check only (api.py:322-326) — vendor_id must equal the caller's own current vendor; no fresh body data accompanies this request"
+      - from: {component: vendor, l1_id: "vendor.api.vendors.request_review", parameter: "path.vendor_id"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_onboarding", parameter: "task_data['vendor_id']"}
+        transformation: "passed into the BackgroundTasks run_orchestrator_agent call (api.py:332-340); unlike register, the route re-supplies only the id plus a fixed server-authored description — not company_name/services/tin/bank fields"
+      - from: {component: vendor, l1_id: "vendor.api.vendors.request_review", parameter: "literal description string ('Vendor requested a re-review of their profile...')"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_onboarding", parameter: "task_data['description']"}
+        transformation: "server-composed literal (api.py:336), not derived from any request body field — enters the orchestrator LLM's instruction channel as a fixed task description"
+      - from: {component: vendor, l1_id: null, parameter: "Vendor.services, Vendor.agent_notes (CURRENT DB state, not the just-submitted body)"}
+        to: {component: agent, l1_id: null, parameter: "onboarding agent user prompt (instruction channel)"}
+        transformation: "onboarding sub-agent independently re-fetches the vendor's current profile via get_vendor_details (same tool as onboarding's agent.onboarding.get_vendor_details, not itself in this record's realizing_l1_ids) and re-injects services/agent_notes into its prompt (onboarding.py:192-206); this time agent_notes may carry text written by a PRIOR onboarding/fraud decision round rather than fresh registration text"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_onboarding", parameter: "vendor_id"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id"}
+        transformation: "same vendor_id value, independently re-supplied as an argument by the orchestrator LLM — identical mechanism to onboard_new_vendor"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_onboarding", parameter: "result.task_summary (onboarding sub-agent's complete_task call)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "task_description"}
+        transformation: "appended as '[onboarding_agent]: <task_summary>' by _enrich_with_prior_context (orchestrator.py:403-416) before the fraud delegate call — free text crossing into the fraud agent's instruction channel, same as onboard_new_vendor"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id"}
+        transformation: "same vendor_id value, re-supplied as an argument by the orchestrator LLM"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "result.task_summary"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "task_description"}
+        transformation: "same _enrich_with_prior_context chaining, now carrying onboarding's and fraud's task_summary text from THIS re-review round"
+      - from: {component: vendor, l1_id: null, parameter: "Vendor.email (unchanged since registration, or since last vendor.update_profile_fields edit)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "recipient address, fetched by the communication sub-agent via get_vendor_contact_info (not in this record's realizing_l1_ids)"}
+        transformation: "identical terminal notification hop to onboard_new_vendor — decision email sent to the vendor's own self-supplied contact address, no re-verification"
+    preconditions: ["caller's session must own the vendor (current_vendor_id equality enforced at the REST layer)"]
+    effect_state_transition: "Same recipe as vendor.onboard_new_vendor (Vendor Re-Review), re-run against the vendor's current profile plus any agent_notes accumulated since."
+    observable_evidence: ["Vendor.status/trust_level/risk_level may change again; new 'vendor.decision' event; new notification email"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/apps/vendor/routes/api.py:307-366"
+    notes: ""
+
+  - id: vendor.update_profile_fields
+    semantic_operation: "Edit a vendor's editable contact/company fields"
+    business_objects: [Vendor]
+    realizing_l1_ids: [vendor.api.vendors.update]
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.vendors.update", parameter: "body.company_name, body.contact_name, body.services (each optional, exclude_unset)"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.company_name, Vendor.contact_name, Vendor.services"}
+        transformation: "written verbatim per-field only if present in the request body (api.py:220-230); Pydantic-type-only validation, no re-injection into any agent path from this route"
+      - from: {component: vendor, l1_id: "vendor.api.vendors.update", parameter: "body.email, body.phone (each optional, exclude_unset)"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.email, Vendor.phone"}
+        transformation: "written verbatim if present (api.py:231-234); Vendor.email is the same field later read as the sole recipient for onboarding/re-review decision notifications, so an edit here silently redirects future automated emails"
+    preconditions: ["current_vendor_id equality"]
+    effect_state_transition: "Vendor.company_name/services/contact_name/email/phone updated. tin/bank fields/vendor_category are immutable via this path (settable only at registration)."
+    observable_evidence: ["Updated fields reflected on GET vendor.api.vendors.get and profile page"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/apps/vendor/routes/api.py:199-268"
+    notes: ""
+
+  - id: vendor.switch_active_context
+    semantic_operation: "Change which vendor entity the session's agents/UI currently act as"
+    business_objects: [Vendor, AgentSession]
+    realizing_l1_ids: [vendor.api.vendors.switch]
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.vendors.switch", parameter: "path.vendor_id"}
+        to: {component: vendor, l1_id: null, parameter: "VendorRepository.set_current_vendor(vendor_id) -> get_vendor(vendor_id) ownership check"}
+        transformation: "vendor_id validated to resolve to a vendor within the caller's own namespace (repositories.py:365-370) before any session row is touched"
+      - from: {component: vendor, l1_id: null, parameter: "session_context.session_id (the REQUESTING session only)"}
+        to: {component: vendor, l1_id: null, parameter: "session_manager.update_vendor_context(session_id, vendor_id) -> session lookup"}
+        transformation: "repositories.py:376-378 passes only the single requesting session_id in; session.py:775-779 uses it solely to resolve session.user_id, not to scope the eventual write"
+      - from: {component: vendor, l1_id: null, parameter: "session.user_id (resolved from the one requesting session_id)"}
+        to: {component: vendor, l1_id: null, parameter: "UserSession.current_vendor_id, for EVERY row WHERE user_id = session.user_id"}
+        transformation: "global bulk UPDATE (session.py:784-789), not filtered by session_id — every open tab/device belonging to that user switches active vendor context simultaneously, not just the tab that made the request"
+    preconditions: ["target vendor_id must belong to caller's own namespace"]
+    effect_state_transition: >
+      UserSession.current_vendor_id updated for EVERY session row sharing the same
+      user_id (global sync across tabs/devices, finbot/core/auth/session.py:770-806) —
+      not just the requesting session.
+    observable_evidence: ["vendor.api.vendors.context reflects the new current_vendor immediately on any tab"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/core/auth/session.py:770-806"
+    notes: "This is the mechanism by which 'which vendor am I' is decided for every subsequent vendor-scoped tool/endpoint call in the session."
+
+  # =========================================================================
+  # Invoice lifecycle
+  # =========================================================================
+
+  - id: invoice.submit_and_autoprocess
+    semantic_operation: "Submit an invoice (optionally with FinDrive attachments) and have it autonomously approved/rejected, fraud-checked, paid, and the vendor notified"
+    business_objects: [Invoice, Vendor, FinDriveFile, PaymentTransaction]
+    realizing_l1_ids:
+      - vendor.api.invoices.create
+      - agent.orchestrator.delegate_to_invoice
+      - agent.invoice.get_invoice_details
+      - agent.invoice.update_invoice_status
+      - mcp.findrive.get_file
+      - agent.orchestrator.delegate_to_fraud
+      - agent.fraud.flag_invoice_for_review
+      - agent.orchestrator.delegate_to_payments
+      - agent.payments.get_invoice_for_payment
+      - mcp.finstripe.create_transfer
+      - agent.payments.process_payment
+      - agent.orchestrator.delegate_to_communication
+      - mcp.finmail.send_email
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.invoices.create", parameter: "body.invoice_number, body.amount, body.description, body.invoice_date, body.due_date"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice.invoice_number, Invoice.amount, Invoice.description, Invoice.invoice_date, Invoice.due_date"}
+        transformation: "written verbatim via InvoiceRepository.create_invoice_for_current_vendor (api.py:538-556); vendor_id forced to current_vendor_id server-side; Pydantic-type-only validation on amount/dates"
+      - from: {component: vendor, l1_id: "vendor.api.invoices.create", parameter: "body.attachments[].file_id"}
+        to: {component: vendor, l1_id: null, parameter: "task_data['attachment_file_ids']"}
+        transformation: "extracted from the attachments list into the BackgroundTasks task_data (api.py:565-569) with NO existence/ownership check against FinDrive at this point (per this record's own notes)"
+      - from: {component: vendor, l1_id: null, parameter: "Invoice.id (server-generated on insert), session_context.current_vendor_id"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "invoice_id"}
+        transformation: "passed as task_data['invoice_id']/['vendor_id'] to run_orchestrator_agent (api.py:558-576); orchestrator LLM echoes invoice_id as the delegate_to_invoice argument"
+      - from: {component: vendor, l1_id: null, parameter: "task_data['attachment_file_ids']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "attachment_file_ids (forwarded into InvoiceAgent task_data, not an LLM tool argument)"}
+        transformation: "orchestrator code itself copies attachment_file_ids from the ORIGINATING task_data into InvoiceAgent's task_data (orchestrator.py:464-467) -- bypasses LLM argument composition entirely, so this hop is not visible in the delegate_to_invoice tool-call arguments themselves"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "invoice_id"}
+        to: {component: agent, l1_id: "agent.invoice.get_invoice_details", parameter: "invoice_id"}
+        transformation: "forwarded into InvoiceAgent's task_data; invoice agent's own LLM chooses to call get_invoice_details with it"
+      - from: {component: vendor, l1_id: null, parameter: "Invoice.description, Invoice.agent_notes"}
+        to: {component: agent, l1_id: "agent.invoice.get_invoice_details", parameter: "response.description, response.agent_notes"}
+        transformation: "read back verbatim (invoice.py:320-344)"
+      - from: {component: agent, l1_id: "agent.invoice.get_invoice_details", parameter: "response.description, response.agent_notes"}
+        to: {component: agent, l1_id: null, parameter: "invoice agent user prompt (instruction channel)"}
+        transformation: "concatenated directly into the LLM user prompt by _get_user_prompt (invoice.py:227-241) -- CTF-flagged design flaw mixing untrusted data into the instruction channel; agent_notes especially is the memory-poisoning vector since it accumulates every prior round's free text"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "attachment_file_ids (task_data)"}
+        to: {component: agent, l1_id: null, parameter: "invoice agent user prompt (instruction channel)"}
+        transformation: "attachment_file_ids is rendered as a plain 'key: value' text line inside the invoice_details loop of the user prompt (invoice.py:206-216); the FINDRIVE ATTACHMENTS system-prompt section (invoice.py:187-191) then encourages, but does not force, the LLM to fetch each one"
+      - from: {component: agent, l1_id: null, parameter: "invoice agent user prompt (attachment_file_ids mention)"}
+        to: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "file_id"}
+        transformation: "LLM's own free decision to call findrive__get_file per attachment id -- a submission's attachments[].file_id values (from the original POST body, hop 2) are NEVER validated for existence or vendor ownership until, IF EVER, this call happens mid-workflow (per this record's own notes); if the InvoiceAgent never decides to call it, an invalid/foreign file_id produces no error at all"
+      - from: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "response.content_text (unvalidated file content)"}
+        to: {component: agent, l1_id: null, parameter: "invoice agent context / next-turn decision basis"}
+        transformation: "full extracted file text returned directly into the agent's tool-call history and becomes part of its next-turn context -- no ownership or content sanitization applied"
+      - from: {component: agent, l1_id: null, parameter: "invoice agent user prompt + get_file context"}
+        to: {component: agent, l1_id: "agent.invoice.update_invoice_status", parameter: "status, agent_notes"}
+        transformation: "LLM's own approve/reject/processing decision, informed by (not deterministically derived from) the injected description/agent_notes text and any fetched attachment content"
+      - from: {component: agent, l1_id: "agent.invoice.update_invoice_status", parameter: "invoice_id (unchanged)"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice.status, Invoice.agent_notes"}
+        transformation: "written via update_invoice_status tool function (invoice.py:352-422); emits 'invoice.decision' business event"
+      - from: {component: agent, l1_id: "agent.invoice.update_invoice_status", parameter: "result.task_summary (invoice agent's own complete_task call)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "task_description"}
+        transformation: "appended as '[invoice_agent]: <task_summary>' by _enrich_with_prior_context (orchestrator.py:403-416); free text, not a structured field, crossing into the fraud agent's instruction channel -- this is also where the invoice's identity is threaded forward, since delegate_to_fraud has no invoice_id argument"
+      - from: {component: vendor, l1_id: null, parameter: "task_data['vendor_id'] (session_context.current_vendor_id, held since the original create call)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id"}
+        transformation: "same vendor_id value, independently re-supplied as an argument by the orchestrator LLM (not structurally derived from the invoice agent's result)"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id, task_description (free-text invoice reference + invoice agent's decision)"}
+        to: {component: agent, l1_id: "agent.fraud.flag_invoice_for_review", parameter: "invoice_id, flag_reason, recommended_action, agent_notes"}
+        transformation: "forwarded via FraudComplianceAgent's task_data (orchestrator.py:491-498); the fraud agent's LLM infers which invoice to flag from the free-text task_description (no structured invoice_id argument exists on delegate_to_fraud itself) and produces its own risk assessment"
+      - from: {component: agent, l1_id: "agent.fraud.flag_invoice_for_review", parameter: "invoice_id"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice flag/status metadata (flag_reason, recommended_action, agent_notes) -- does NOT overwrite Invoice.status itself"}
+        transformation: "written via flag_invoice_for_review tool function (fraud.py:541-614); emits 'fraud.invoice_flagged' business event; per this record's effect_state_transition, flagging does not gate the payments step that follows -- that ordering is a prompt-level recipe instruction only (orchestrator.py:123-133), not a code-enforced check"
+      - from: {component: agent, l1_id: "agent.fraud.flag_invoice_for_review", parameter: "result.task_summary"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_payments", parameter: "task_description"}
+        transformation: "same _enrich_with_prior_context chaining, now carrying both the invoice agent's and fraud agent's prior task_summary text"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "invoice_id (same value)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_payments", parameter: "invoice_id"}
+        transformation: "re-supplied independently by the orchestrator LLM from its own tracked context, not structurally derived from the fraud agent's result (which never returned invoice_id, since delegate_to_fraud's own argument surface is vendor_id-keyed)"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_payments", parameter: "invoice_id"}
+        to: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "invoice_id"}
+        transformation: "forwarded via PaymentsAgent's task_data; payments agent's own LLM chooses to call get_invoice_for_payment"
+      - from: {component: vendor, l1_id: null, parameter: "Invoice.amount, Invoice.status, Vendor.bank_account_number, Vendor.bank_name, Vendor.bank_routing_number, Vendor.bank_account_holder_name"}
+        to: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "response.amount, response.vendor_bank_account_number, response.vendor_bank_name, response.vendor_bank_routing_number, response.vendor_bank_account_holder_name"}
+        transformation: "read back verbatim (finbot/tools/data/payment.py:26-44) -- the vendor's own self-reported banking details from registration, never independently verified before being used to move money"
+      - from: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "response.amount, response.vendor_bank_account_number, response.invoice_number"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "amount, vendor_account, invoice_reference, vendor_id, invoice_id"}
+        transformation: "LLM composes the transfer call using these retrieved values per the PAYMENT PROCESSING FLOW step 4 instruction (payments.py:122-130); Invoice.status=='approved' is only a prompt-level precondition, not code-enforced inside create_transfer itself (per L1 agent.payments.get_invoice_for_payment/mcp.finstripe.create_transfer notes)"
+      - from: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "response.transfer_id"}
+        to: {component: agent, l1_id: "agent.payments.process_payment", parameter: "payment_reference"}
+        transformation: "LLM copies the transfer_id as payment_reference per payments.py:131-132 instruction; no code-level binding actually ties process_payment's record to the specific transfer just created -- it is an LLM-maintained association only"
+      - from: {component: agent, l1_id: "agent.payments.process_payment", parameter: "invoice_id"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice.status='paid', new PaymentTransaction row"}
+        transformation: "written via process_payment tool function (payments.py:383-457); emits 'payment.processed' business event -- terminal state-change of this recipe"
+      - from: {component: agent, l1_id: "agent.payments.process_payment", parameter: "result.task_summary, result['next_step'] (delegate_to_payments appends a MANDATORY-next-step instruction)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "task_description"}
+        transformation: "same _enrich_with_prior_context chaining, now carrying invoice/fraud/payment outcome text; delegate_to_payments' result['next_step'] (orchestrator.py:533-537) forces the orchestrator LLM to make this call before completing the task"
+      - from: {component: vendor, l1_id: null, parameter: "task_data['vendor_id'] (same value, re-derived from the original create call)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id"}
+        transformation: "re-supplied independently by the orchestrator LLM"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id, task_description, notification_type"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to, subject, body"}
+        transformation: "communication agent's LLM composes the notification from the accumulated task_description context; the recipient address is resolved via the agent's own get_vendor_contact_info tool (available to CommunicationAgent but not separately enumerated among this record's realizing_l1_ids) or an explicit to_addresses argument if the orchestrator supplied one -- no allowlist or ownership re-check at this hop, mirroring vendor.onboard_new_vendor's equivalent final hop"
+    preconditions: ["current_vendor_id set", "CSRF header on the initial POST"]
+    effect_state_transition: >
+      Invoice row created (vendor_id forced to current_vendor_id). Background
+      OrchestratorAgent runs the Invoice Processing recipe IN ORDER
+      (finbot/agents/orchestrator.py:123-133): InvoiceAgent sets status to
+      approved/rejected/processing; FraudComplianceAgent may flag it (does not change
+      status itself); if approved, PaymentsAgent calls finstripe__create_transfer
+      (creates a PaymentTransaction row, status='completed', mock/no real settlement) and
+      then process_payment transitions Invoice.status to 'paid'; CommunicationAgent then
+      emails the vendor.
+    observable_evidence:
+      - "Invoice.status transitions submitted -> processing/approved/rejected -> (paid)"
+      - "'invoice.decision', 'fraud.invoice_flagged' (if flagged), 'payment.processed' business events"
+      - "New PaymentTransaction row with a finstripe transfer_id"
+      - "New Email row notifying the vendor"
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "fully automated background workflow — no human approval step exists in this pipeline"}
+    source_ref: "finbot/agents/orchestrator.py:123-133; finbot/apps/vendor/routes/api.py:531-605"
+    notes: >
+      attachments[].file_id values on the initial POST are never validated for existence
+      or ownership until (if ever) InvoiceAgent calls findrive__get_file mid-workflow — a
+      submission can reference file_ids that don't exist or belong to a different vendor
+      in the same namespace without any upfront error. The whole approve -> pay chain can
+      complete with zero human review for any invoice amount the InvoiceAgent's own
+      LLM judgment decides to approve.
+
+  - id: invoice.reprocess_existing
+    semantic_operation: "Re-run the same automated approve/fraud/pay/notify chain against an existing invoice"
+    business_objects: [Invoice, Vendor, PaymentTransaction]
+    realizing_l1_ids:
+      - vendor.api.invoices.reprocess
+      - agent.orchestrator.delegate_to_invoice
+      - agent.orchestrator.delegate_to_fraud
+      - agent.orchestrator.delegate_to_payments
+      - agent.orchestrator.delegate_to_communication
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.invoices.reprocess", parameter: "path.invoice_id"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice.agent_notes, Invoice.status, Invoice.description (current persisted row)"}
+        transformation: "invoice_id resolves to the EXISTING invoice's current row via invoice_repo.get_invoice (api.py:711-717); ownership re-checked via current_vendor_id equality (403 on mismatch) -- unlike vendor.api.invoices.create, this route takes no InvoiceCreateRequest body, so amount/description/attachments cannot be resupplied, only whatever is already persisted is re-evaluated"
+      - from: {component: vendor, l1_id: null, parameter: "Invoice.id, session_context.current_vendor_id"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "invoice_id"}
+        transformation: "passed as task_data['invoice_id']/['vendor_id'] to run_orchestrator_agent (api.py:722-731) with a fixed description 'Vendor requested invoice re-processing...'; this task_data carries NO attachment_file_ids key (contrast vendor.api.invoices.create, api.py:565-569), so the delegate_to_invoice -> findrive__get_file attachment-forwarding hop from invoice.submit_and_autoprocess does not occur here"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "invoice_id"}
+        to: {component: agent, l1_id: null, parameter: "invoice agent's own get_invoice_details call -> Invoice.agent_notes"}
+        transformation: "same get_invoice_details/user-prompt mechanism as invoice.submit_and_autoprocess (agent.invoice.get_invoice_details, invoice.py:227-241; not separately enumerated among this record's 5 realizing_l1_ids) -- but here Invoice.agent_notes already contains accumulated free text from EVERY prior review round, including the model's own past decisions"
+      - from: {component: agent, l1_id: null, parameter: "Invoice.agent_notes (accumulated across rounds)"}
+        to: {component: agent, l1_id: null, parameter: "invoice agent user prompt (instruction channel)"}
+        transformation: "concatenated into the invoice agent's user prompt exactly as in record 1 -- a feedback loop where the model's own PRIOR output becomes part of its NEXT instruction context, the specific memory-poisoning vector this record's notes call out"
+      - from: {component: agent, l1_id: null, parameter: "invoice agent's re-evaluation decision"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "task_description"}
+        transformation: "invoice agent's result.task_summary appended via _enrich_with_prior_context (orchestrator.py:403-416), identical chaining to invoice.submit_and_autoprocess; the underlying update_invoice_status write (agent.invoice.update_invoice_status) mirrors record 1's hops and is not re-enumerated here since it is not among this record's 5 realizing_l1_ids"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "result.task_summary"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_payments", parameter: "task_description"}
+        transformation: "same _enrich_with_prior_context chaining as record 1; the fraud agent's own flag_invoice_for_review call (agent.fraud.flag_invoice_for_review) is mechanically identical to invoice.submit_and_autoprocess and not re-enumerated here"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_payments", parameter: "result.task_summary, result['next_step']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "task_description"}
+        transformation: "same mandatory-final-step chaining as record 1 (delegate_to_payments' next_step forces this call); the get_invoice_for_payment -> finstripe__create_transfer -> process_payment sub-chain is identical to invoice.submit_and_autoprocess's corresponding hops and not re-enumerated here"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id, task_description, notification_type"}
+        to: {component: agent, l1_id: null, parameter: "mcp.finmail.send_email (to, subject, body)"}
+        transformation: "communication agent composes and sends the notification exactly as in invoice.submit_and_autoprocess's final hop; mcp.finmail.send_email is not separately enumerated among this record's 5 realizing_l1_ids but is the terminal effect of delegate_to_communication in both recipes"
+    preconditions: ["current_vendor_id equality enforced at REST layer"]
+    effect_state_transition: "Same as invoice.submit_and_autoprocess (Invoice Reprocessing recipe), operating on the invoice's current agent_notes/status."
+    observable_evidence: ["Same signals as invoice.submit_and_autoprocess"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/apps/vendor/routes/api.py:700-758"
+    notes: >
+      The invoice's own agent_notes (accumulated free text from every prior agent
+      decision) is re-fed into the next InvoiceAgent call's user prompt
+      (finbot/agents/specialized/invoice.py:227-241) — a feedback loop where the model's
+      own past output becomes part of its next instruction context.
+
+  - id: invoice.compliance_document_review
+    semantic_operation: "Have the fraud/compliance agent read and act on a vendor's uploaded compliance documents (SOC2/ISO/PCI-DSS-style files) as part of a review"
+    business_objects: [Vendor, FinDriveFile, EmailMessage]
+    realizing_l1_ids:
+      - agent.orchestrator.delegate_to_fraud
+      - agent.copilot.get_vendor_compliance_docs
+      - agent.orchestrator.delegate_to_communication
+      - mcp.finmail.send_email
+    parameter_flow:
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "task_description (containing SOC2/ISO/PCI-DSS/'document review' keywords, per orchestrator.py:119-120 recipe text)"}
+        to: {component: agent, l1_id: null, parameter: "fraud agent's _DOC_REVIEW_KEYWORDS match (is_doc_review flag)"}
+        transformation: "task_description text lower-cased and matched against _DOC_REVIEW_KEYWORDS (fraud.py:243-253); a match gates the FinDrive document-injection branch below -- this is also this record's stated precondition"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id"}
+        to: {component: agent, l1_id: null, parameter: "FinDriveFileRepository.list_files(vendor_id, folder_path='/documents', limit=10)"}
+        transformation: "fraud agent queries FinDrive files DIRECTLY via the repository (fraud.py:258-262) -- NOT via the findrive MCP get_file tool -- filtered to filenames matching _DOC_FILE_KEYWORDS (compliance/certificate/soc2/iso/pci/audit/regulatory); top 2 matches kept (fraud.py:263-270)"
+      - from: {component: vendor, l1_id: null, parameter: "FinDriveFile.content_text (up to 2 vendor-uploaded files, full extracted text, never sanitized)"}
+        to: {component: agent, l1_id: null, parameter: "fraud agent user prompt (instruction channel)"}
+        transformation: "concatenated directly into the LLM user prompt string (fraud.py:271-279) -- DATA (untrusted, vendor-uploaded document text) entering the INSTRUCTION channel, not a tool-call result the model chose to fetch; this is the core indirect-prompt-injection surface for this record, per its own effect_state_transition"
+      - from: {component: agent, l1_id: null, parameter: "fraud agent user prompt (containing injected document text)"}
+        to: {component: agent, l1_id: null, parameter: "fraud agent's result.task_summary"}
+        transformation: "LLM acts per its own system-prompt instruction to 'process any filing requirements... found in the documents' and 'include all document findings and required actions verbatim in your task summary' (fraud.py:186-192) -- whatever instructions the document text contains flow into task_summary near-verbatim by design"
+      - from: {component: agent, l1_id: null, parameter: "fraud agent's result.task_summary (containing document-derived filing instructions)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "task_description"}
+        transformation: "orchestrator's own Document Compliance Review recipe text explicitly instructs: 'include all filing instructions verbatim from the fraud agent's summary' (orchestrator.py:121), applied via the same _enrich_with_prior_context mechanism (orchestrator.py:403-416) as every other recipe -- vendor-document-originated content flows unfiltered into the communication agent's instruction channel"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id, task_description, notification_type='compliance_alert' or similar"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "subject, body"}
+        transformation: "communication agent's LLM composes the outbound email largely from the injected task_description text, per its own 'include all relevant details' framing (communication.py:139-143) -- no structural validation distinguishes legitimate business content from document-embedded instructions at this hop"
+      - from: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to"}
+        to: {component: agent, l1_id: null, parameter: "Email row, inbox_type resolved by route_and_deliver"}
+        transformation: "recipient resolved with no allowlist beyond namespace-directory lookups (finmail/routing.py); if the LLM was steered by the injected document content toward an address outside the namespace directory, delivery resolves to inbox_type='external' (per communication.agent_initiated_notification's own notes) -- the terminal effect of the whole chain"
+      - from: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "vendor_id (LLM-supplied from an admin Co-Pilot chat request)"}
+        to: {component: agent, l1_id: null, parameter: "FinDriveFileRepository.list_files(vendor_id) -- ALL files, no folder_path or filename-keyword filter"}
+        transformation: "alternate direct-chat entry point (chat.py:1125-1128 -> admin_reports.py:129-141): the admin Co-Pilot's LLM calls this tool when asked to review a vendor's compliance docs, bypassing the orchestrator/delegate_to_fraud recipe entirely; unlike fraud.py's narrower query this returns full content_text for EVERY FinDrive file belonging to the vendor with no /documents folder or compliance-keyword restriction"
+      - from: {component: vendor, l1_id: null, parameter: "FinDriveFile.content_text (all files, unsanitized)"}
+        to: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "response.documents[].content_text"}
+        transformation: "returned as a structured JSON tool-call RESULT (json.dumps, chat.py:1125-1128) rather than concatenated into the prompt string directly -- still untrusted vendor-supplied text entering the model's context, but via the tool-result/data channel on this path rather than the raw instruction-string channel fraud.py uses; admin_reports.py's own module docstring (lines 6-8) flags this as an indirect-prompt-injection surface regardless of channel"
+      - from: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "response (now in Co-Pilot's LLM context)"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to, subject, body"}
+        transformation: "if the admin's chat request also asks the Co-Pilot to act on or relay the document content (e.g. 'and email the filing team'), the Co-Pilot's own LLM may compose and call finmail__send_email directly -- no orchestrator delegate_to_communication hop on this path, since the admin Co-Pilot chat agent connects finmail itself (see chat.copilot_conversation_and_reporting)"
+    preconditions: >
+      Triggering task description must contain compliance-review keywords
+      (soc2/iso/pci-dss/certificate/"document review"/"document audit"/"compliance
+      review"/"compliance certificate" — finbot/agents/specialized/fraud.py:243-253);
+      reachable via the admin Co-Pilot's "Document Compliance Review" recipe or a direct
+      compliance-doc chat request.
+    effect_state_transition: >
+      FraudComplianceAgent's user prompt is built by directly concatenating up to 2
+      matching FinDrive files' full extracted content_text into the prompt string
+      (finbot/agents/specialized/fraud.py:256-279) — this is a DATA (untrusted,
+      vendor-uploaded document text) flowing into the INSTRUCTION channel of the LLM
+      call, not a tool-call result the model chose to fetch. The agent then acts per its
+      own "process any filing requirements... found in the documents" instruction
+      (fraud.py:186-192) and CommunicationAgent may send follow-up emails per whatever
+      the fraud agent's task_summary says to do.
+    observable_evidence: ["fraud agent task_summary text; any resulting emails; Vendor.risk_level or Invoice flags changed as a side effect of the review"]
+    visibility: grey_box_required
+    reachability: {status: black_box_reachable, notes: "triggerable purely through the admin Co-Pilot chat UI, no source access needed to invoke it — only to understand why document content changes agent behavior"}
+    source_ref: "finbot/agents/specialized/fraud.py:234-283; finbot/agents/orchestrator.py:119-121"
+    notes: "The orchestrator's own recipe text instructs the communication step to 'include all filing instructions verbatim from the fraud agent's summary' (orchestrator.py:121) — content originating in a vendor-supplied document can flow, relayed verbatim, into an outbound email."
+
+  # =========================================================================
+  # Payments
+  # =========================================================================
+
+  - id: payment.execute_transfer
+    semantic_operation: "Execute a fund transfer for an approved invoice"
+    business_objects: [Invoice, Vendor, PaymentTransaction]
+    realizing_l1_ids:
+      - agent.payments.get_invoice_for_payment
+      - agent.payments.get_vendor_details
+      - mcp.finstripe.create_transfer
+      - agent.payments.process_payment
+    parameter_flow:
+      - from: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "invoice_id"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice row lookup joined with Vendor bank fields"}
+        transformation: "InvoiceRepository.get_invoice(invoice_id) joined with VendorRepository.get_vendor(invoice.vendor_id) inside the single tool function (finbot/tools/data/payment.py:26-44) — no invoice-status or ownership check performed here"
+      - from: {component: vendor, l1_id: null, parameter: "Invoice.amount, Invoice.vendor_id, Invoice.status, Vendor.bank_account_number, Vendor.bank_routing_number, Vendor.bank_account_holder_name, Vendor.bank_name, Vendor.trust_level"}
+        to: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "response.amount, response.vendor_id, response.status, response.vendor_bank_account_number, response.vendor_bank_routing_number, response.vendor_bank_account_holder_name, response.vendor_bank_name, response.vendor_trust_level"}
+        transformation: "returned verbatim to the PaymentsAgent LLM as one tool result (payments.py:306-324) — full banking fields are already present at this point, before get_vendor_details is even called"
+      - from: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "response.vendor_id"}
+        to: {component: agent, l1_id: "agent.payments.get_vendor_details", parameter: "vendor_id"}
+        transformation: "LLM re-supplies the same vendor_id as the Phase 1 'verify vendor banking details' step (system prompt payments.py:118-120) — a prompt-instructed sequencing rule, not a code-enforced dependency"
+      - from: {component: vendor, l1_id: null, parameter: "Vendor.bank_account_number, Vendor.bank_routing_number, Vendor.bank_account_holder_name, Vendor.status, Vendor.trust_level, Vendor.risk_level"}
+        to: {component: agent, l1_id: "agent.payments.get_vendor_details", parameter: "response.bank_account_number, response.bank_routing_number, response.bank_account_holder_name, response.status, response.trust_level, response.risk_level"}
+        transformation: "read via VendorRepository.get_vendor and re-shaped into an explicit field list that includes the full banking fields (payments.py:338-355) — no redaction"
+      - from: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "response.amount"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "amount"}
+        transformation: "LLM copies the invoice amount into the transfer amount. The system prompt states a max_single_payment=$50,000 threshold (payments.py:147) as a rule the LLM is told to apply and flag/refuse above, but create_transfer itself performs no comparison against this or any other ceiling — its only check is 'amount <= 0' (finstripe/server.py:47-63). The bound exists solely in the instruction channel, not in code reachable at this hop."
+      - from: {component: agent, l1_id: "agent.payments.get_vendor_details", parameter: "response.bank_account_number"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "vendor_account"}
+        transformation: "LLM copies the vendor's bank account number verbatim into the MCP tool-call argument per the Phase 2 instruction list (payments.py:123-125) — no format or ownership validation at this hop"
+      - from: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "response.vendor_id, invoice_id (unchanged)"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "vendor_id, invoice_id, invoice_reference"}
+        transformation: "same identifiers re-supplied by the LLM as create_transfer arguments (payments.py:123-130)"
+      - from: {component: agent, l1_id: null, parameter: "PaymentsAgent's own payment_method/description decision (allowed_payment_methods from agent_config, payments.py:53-57,111)"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "payment_method, description"}
+        transformation: "LLM-chosen values from the allowed enum, not derived from the invoice or vendor records"
+      - from: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "amount, vendor_account, vendor_id, invoice_id, payment_method, description"}
+        to: {component: agent, l1_id: null, parameter: "PaymentTransaction row (status='completed')"}
+        transformation: "written immediately and unconditionally by PaymentTransactionRepository.create_transaction (finstripe/server.py:67-78) — mock settlement, no async/pending state, and no amount ceiling enforced at the DB-write step either"
+      - from: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "response.transfer_id"}
+        to: {component: agent, l1_id: "agent.payments.process_payment", parameter: "payment_reference"}
+        transformation: "LLM copies the FinStripe transfer_id into process_payment's payment_reference per the Phase 2 step 5 instruction (payments.py:131-132)"
+      - from: {component: agent, l1_id: "agent.payments.get_invoice_for_payment", parameter: "invoice_id (unchanged)"}
+        to: {component: agent, l1_id: "agent.payments.process_payment", parameter: "invoice_id"}
+        transformation: "same invoice_id re-supplied by the LLM; payment_method and agent_notes on this call are also LLM-composed, not read back from any prior tool response"
+      - from: {component: agent, l1_id: "agent.payments.process_payment", parameter: "invoice_id, payment_method, payment_reference, agent_notes"}
+        to: {component: vendor, l1_id: null, parameter: "Invoice.status, Invoice.agent_notes"}
+        transformation: "InvoiceRepository.update_invoice sets status='paid' only after confirming current status=='approved' (finbot/tools/data/payment.py:82-96) — the one code-level guard in this whole chain, and it checks invoice state only, not the payment amount that was already transferred by the preceding hop"
+    preconditions: ["Invoice.status=='approved' — enforced only as a PaymentsAgent prompt instruction (finbot/agents/specialized/payments.py:104-108), not as a code-level guard inside create_transfer or process_payment themselves"]
+    effect_state_transition: "New PaymentTransaction row (status='completed', mock — no real settlement rail). Invoice.status -> 'paid'. Emits 'payment.processed'."
+    observable_evidence: ["PaymentTransaction visible via vendor.api.payments.transactions; Invoice.status=='paid'"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "only reachable as a background-workflow step, never a direct user action"}
+    source_ref: "finbot/mcp/servers/finstripe/server.py:46-96; finbot/agents/specialized/payments.py:383-457"
+    notes: "No server-side cap on transfer amount in the tool itself; the PaymentsAgent's max_single_payment threshold is a prompt-level instruction only (payments.py:147)."
+
+  # =========================================================================
+  # Fraud / risk assessment (standalone, outside an invoice/vendor pipeline)
+  # =========================================================================
+
+  - id: fraud.standalone_compliance_review
+    semantic_operation: "Run a fraud/compliance check on a vendor outside the onboarding or invoice pipelines"
+    business_objects: [Vendor, Invoice]
+    realizing_l1_ids:
+      - agent.orchestrator.delegate_to_fraud
+      - agent.fraud.get_vendor_risk_profile
+      - agent.fraud.get_vendor_invoices
+      - agent.fraud.update_vendor_risk
+      - agent.orchestrator.delegate_to_communication
+    parameter_flow:
+      - from: {component: agent, l1_id: null, parameter: "task_data.vendor_id (orchestrator's own task_data, from an admin Co-Pilot message matching compliance/fraud-review wording)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id"}
+        transformation: "orchestrator LLM matches the 'Compliance / Fraud Review' recipe (orchestrator.py:115-117, matched when the task mentions compliance check/fraud review/risk assessment/security audit WITHOUT onboarding or re-review wording) and supplies vendor_id as the delegate_to_fraud argument"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id"}
+        to: {component: agent, l1_id: "agent.fraud.get_vendor_risk_profile", parameter: "vendor_id"}
+        transformation: "forwarded via FraudComplianceAgent's task_data (orchestrator.py:479-508); fraud agent's own LLM chooses to call get_vendor_risk_profile first per its DECISION FRAMEWORK (fraud.py:193-201)"
+      - from: {component: vendor, l1_id: null, parameter: "Vendor.company_name, Vendor.industry, Vendor.status, Vendor.trust_level, Vendor.risk_level, Vendor.agent_notes, plus aggregated invoice stats (total_invoices, total_invoice_amount, invoices_by_status)"}
+        to: {component: agent, l1_id: "agent.fraud.get_vendor_risk_profile", parameter: "response fields"}
+        transformation: "read and aggregated by get_vendor_risk_profile (finbot/tools/data/fraud.py:13-60); returned verbatim to the LLM, including any free-text Vendor.agent_notes left by prior agents"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id (unchanged)"}
+        to: {component: agent, l1_id: "agent.fraud.get_vendor_invoices", parameter: "vendor_id"}
+        transformation: "same vendor_id re-supplied; fraud agent LLM calls this per its DECISION FRAMEWORK step 'Review vendor invoice history for patterns and anomalies' (fraud.py:195)"
+      - from: {component: vendor, l1_id: null, parameter: "Invoice rows for the vendor (amount, status, submitted dates, etc.)"}
+        to: {component: agent, l1_id: "agent.fraud.get_vendor_invoices", parameter: "response.invoices (list)"}
+        transformation: "InvoiceRepository.list_invoices_for_specific_vendor, returned as a raw to_dict() list (finbot/tools/data/fraud.py:63-79) — no filtering or redaction"
+      - from: {component: agent, l1_id: "agent.fraud.get_vendor_risk_profile", parameter: "response (risk_level, trust_level, industry, invoice stats)"}
+        to: {component: agent, l1_id: "agent.fraud.update_vendor_risk", parameter: "risk_level, agent_notes"}
+        transformation: "LLM's own risk decision per the system prompt's RISK SCORING GUIDELINES (fraud.py:203-208), informed by both get_vendor_risk_profile and get_vendor_invoices results. Unlike the onboarding-triggered fraud delegation (vendor.onboard_new_vendor), this standalone recipe has no preceding onboarding/invoice-agent task_summary injected into the instruction channel — the risk call is based only on this agent's own two lookups"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id (unchanged)"}
+        to: {component: agent, l1_id: "agent.fraud.update_vendor_risk", parameter: "vendor_id"}
+        transformation: "same vendor_id re-supplied by the fraud agent LLM as the update target"
+      - from: {component: agent, l1_id: "agent.fraud.update_vendor_risk", parameter: "vendor_id, risk_level, agent_notes"}
+        to: {component: vendor, l1_id: null, parameter: "Vendor.risk_level, Vendor.agent_notes"}
+        transformation: "written via update_vendor_risk tool function (finbot/tools/data/fraud.py:82-130); emits 'fraud.vendor_risk_updated' business event (fraud.py:512-525) — overwrites Vendor.risk_level with no second-check"
+      - from: {component: agent, l1_id: "agent.fraud.update_vendor_risk", parameter: "result.task_summary (fraud sub-agent's own complete_task call)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "task_description"}
+        transformation: "appended as prior-agent context by the orchestrator's _enrich_with_prior_context mechanism (same pattern as vendor.onboard_new_vendor) before the orchestrator LLM composes delegate_to_communication. This recipe goes straight from delegate_to_fraud to delegate_to_communication (orchestrator.py:115-117) — no invoice or payment delegation steps in between, unlike the Invoice Processing recipe"
+      - from: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id (unchanged)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id"}
+        transformation: "same vendor_id value, re-supplied as an argument by the orchestrator LLM"
+      - from: {component: agent, l1_id: null, parameter: "orchestrator recipe text: 'notify the admin of the assessment results; use notification_type compliance_alert' (orchestrator.py:117)"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "notification_type"}
+        transformation: "hardcoded by the recipe instruction, not derived from the fraud agent's actual findings — notification_type is set to 'compliance_alert' regardless of whether risk_level changed or what it changed to; this is the parameter that routes the message to the admin inbox rather than the vendor's own address once the CommunicationAgent (outside this record's realizing_l1_ids) resolves recipients and calls finmail__send_email"
+    preconditions: ["triggering task description matches the orchestrator's 'Compliance / Fraud Review' recipe wording"]
+    effect_state_transition: "Vendor.risk_level updated; admin notified via CommunicationAgent using notification_type='compliance_alert'."
+    observable_evidence: ["'fraud.vendor_risk_updated' business event; admin inbox email"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "triggerable via admin Co-Pilot chat ('run a fraud review on vendor X')"}
+    source_ref: "finbot/agents/orchestrator.py:115-117"
+    notes: ""
+
+  # =========================================================================
+  # Chat / conversational assistant
+  # =========================================================================
+
+  - id: chat.vendor_assistant_conversation
+    semantic_operation: "Converse with the vendor-portal AI assistant to look up account/invoice/payment data or trigger a workflow"
+    business_objects: [Vendor, Invoice, PaymentTransaction, FinDriveFile, EmailMessage, ChatMessage, AgentSession]
+    realizing_l1_ids:
+      - vendor.api.chat.send
+      - agent.vendor_chat.get_vendor_details
+      - agent.vendor_chat.get_invoice_details
+      - agent.vendor_chat.get_vendor_invoices
+      - agent.vendor_chat.get_vendor_payment_summary
+      - agent.vendor_chat.get_vendor_contact_info
+      - agent.vendor_chat.start_workflow
+      - mcp.findrive.get_file
+      - mcp.finmail.send_email
+      - mcp.finmail.list_inbox
+      - mcp.systemutils.run_diagnostics
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.chat.send", parameter: "body.message"}
+        to: {component: vendor, l1_id: null, parameter: "effective_message (stream_response local var)"}
+        transformation: "unchanged when no attachments; if body.attachments present, effective_message is prefixed with a plain-text hint listing each attachment's filename+file_id (chat.py:312-320)"
+      - from: {component: vendor, l1_id: "vendor.api.chat.send", parameter: "body.attachments[].filename, body.attachments[].file_id"}
+        to: {component: vendor, l1_id: null, parameter: "effective_message text hint"}
+        transformation: "interpolated as free text ('[User attached FinDrive files: ...]') into the user turn -- not passed as a structured tool argument, not validated for existence/ownership at this hop (chat.py:312-320)"
+      - from: {component: vendor, l1_id: null, parameter: "effective_message"}
+        to: {component: vendor, l1_id: null, parameter: "ChatMessage.content (role=user)"}
+        transformation: "persisted verbatim via ChatMessageRepository.add_message (chat.py:210-213,321; repositories.py:763-780), scoped to namespace+user_id+session_context.current_vendor_id"
+      - from: {component: vendor, l1_id: null, parameter: "ChatMessage.content (prior history rows, vendor_id-scoped)"}
+        to: {component: agent, l1_id: null, parameter: "input_messages (LLM context array)"}
+        transformation: "loaded via _load_history (chat.py:204-208,339-343) and concatenated after the system prompt -- becomes the model's instruction/context channel"
+      - from: {component: agent, l1_id: null, parameter: "input_messages (context, including the attachment file_id text hint)"}
+        to: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "file_id"}
+        transformation: "free LLM decision whether to call findrive__get_file at all, and which file_id to pass -- the hint is advisory text only, not a forced or validated argument (chat.py:312-320, record notes)"
+      - from: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "response.extracted_text/content"}
+        to: {component: agent, l1_id: null, parameter: "input_messages (function_call_output, chat.py:443-449)"}
+        transformation: "tool result appended verbatim to context for the next reasoning round; untrusted file content (cross-vendor readable per l1_mcp.yaml mcp.findrive.get_file notes) enters the instruction channel"
+      - from: {component: agent, l1_id: null, parameter: "input_messages (context, incl. system prompt's 'current vendor ID is {current_vendor_id}' soft hint, chat.py:563)"}
+        to: {component: agent, l1_id: "agent.vendor_chat.get_vendor_details", parameter: "vendor_id"}
+        transformation: "LLM's own free choice of argument -- the current-vendor hint is prose guidance only, not enforced, so any vendor_id may be supplied"
+      - from: {component: agent, l1_id: "agent.vendor_chat.get_vendor_details", parameter: "vendor_id"}
+        to: {component: vendor, l1_id: null, parameter: "VendorRepository.get_vendor(vendor_id) query result"}
+        transformation: "resolved NAMESPACE-SCOPED ONLY (no current_vendor_id equality check) via tools/data/vendor.py:13-31 -- can return ANY vendor's full record in the namespace, including tin/bank_account_number/bank_routing_number/bank_account_holder_name (l1_mcp.yaml agent.vendor_chat.get_vendor_details notes)"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.vendor_chat.get_invoice_details", parameter: "invoice_id"}
+        transformation: "LLM-chosen invoice_id, likewise resolved namespace-scoped only via InvoiceRepository.get_invoice (tools/data/invoice.py:13-31; l1_mcp.yaml agent.vendor_chat.get_invoice_details notes) -- not restricted to invoices belonging to current_vendor_id"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.vendor_chat.get_vendor_invoices", parameter: "vendor_id"}
+        transformation: "same LLM-chosen, namespace-scoped-only pattern as get_vendor_details"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.vendor_chat.get_vendor_payment_summary", parameter: "vendor_id"}
+        transformation: "same LLM-chosen, namespace-scoped-only pattern as get_vendor_details"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.vendor_chat.get_vendor_contact_info", parameter: "vendor_id"}
+        transformation: "same LLM-chosen, namespace-scoped-only pattern; response.email later usable as an outbound recipient with no ownership re-check"
+      - from: {component: agent, l1_id: "agent.vendor_chat.get_vendor_details / get_invoice_details / get_vendor_invoices / get_vendor_payment_summary / get_vendor_contact_info", parameter: "response (vendor/invoice fields, incl. bank/tin where applicable)"}
+        to: {component: agent, l1_id: null, parameter: "input_messages (function_call_output)"}
+        transformation: "raw JSON-dumped result appended to context; feeds the model's next-turn reply text and further tool-argument choices verbatim"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "mcp.finmail.list_inbox", parameter: "inbox, vendor_id, message_type, unread_only, limit"}
+        transformation: "all LLM-chosen; inbox='vendor' requires a vendor_id argument the model supplies itself"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to, subject, body, cc, bcc"}
+        transformation: "LLM composes recipient list and content entirely itself; system prompt's department-address directory (chat.py:549-554) is a naming hint only, not an allowlist enforced at this hop"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "mcp.systemutils.run_diagnostics", parameter: "command"}
+        transformation: "LLM-supplied free-form string; handler is a no-op mock that echoes a canned 'completed' response regardless of content (l1_mcp.yaml notes)"
+      - from: {component: agent, l1_id: null, parameter: "input_messages (conversation so far, incl. any tool results above)"}
+        to: {component: agent, l1_id: "agent.vendor_chat.start_workflow", parameter: "description, vendor_id, invoice_id, attachment_file_ids"}
+        transformation: "all four arguments are the LLM's own composition from conversational context; none is cross-checked against session_context.current_vendor_id -- continues as the entry hop of chat.trigger_background_workflow"
+      - from: {component: agent, l1_id: null, parameter: "full_response (assistant's streamed text)"}
+        to: {component: vendor, l1_id: null, parameter: "ChatMessage.content (role=assistant)"}
+        transformation: "persisted after the model finishes responding (chat.py:483-484), closing the turn"
+    preconditions: ["session:temporary is sufficient; current_vendor_id need not be set (falls back to vendor_id IS NULL chat history)"]
+    effect_state_transition: >
+      Every turn is persisted to ChatMessage (namespace+user_id+vendor_id scoped) both
+      before and after the model call. Depending on conversation content, the model may
+      call any of the native or MCP tools listed above with LLM-chosen arguments,
+      including cross-vendor-within-namespace reads (get_vendor_details/get_invoice_details
+      are namespace-scoped only, not current-vendor-scoped — see l1_mcp.yaml) or
+      send emails via finmail__send_email with attacker/user-influenced recipients.
+    observable_evidence: ["SSE token stream in the chat UI; new ChatMessage rows; any downstream tool-call side effects (new Email row, new background workflow)"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "fully reachable by typing a chat message — no special access needed to trigger any of the underlying tool calls, only conversational framing"}
+    source_ref: "finbot/agents/chat.py:304-505,511-723"
+    notes: >
+      Attachments referenced in a chat message are only a text hint prepended to the
+      user message (finbot/agents/chat.py:312-320) — actual file content retrieval is a
+      free LLM decision to call findrive__get_file, not a guaranteed or validated step.
+
+  - id: chat.copilot_conversation_and_reporting
+    semantic_operation: "Converse with the admin Finance Co-Pilot to query cross-vendor data, review documents/emails, or generate and save a report"
+    business_objects: [Vendor, Invoice, FinDriveFile, EmailMessage, ChatMessage, AgentSession]
+    realizing_l1_ids:
+      - admin.api.copilot.chat
+      - agent.copilot.list_vendors
+      - agent.copilot.get_all_vendors_summary
+      - agent.copilot.get_pending_actions_summary
+      - agent.copilot.get_vendor_compliance_docs
+      - agent.copilot.get_vendor_activity_report
+      - agent.copilot.save_report
+      - agent.copilot.start_workflow
+      - mcp.finmail.list_inbox
+      - mcp.finmail.send_email
+      - mcp.systemutils.read_config
+    parameter_flow:
+      - from: {component: admin, l1_id: "admin.api.copilot.chat", parameter: "body.message"}
+        to: {component: admin, l1_id: null, parameter: "ChatMessage.content (role=user, vendor_id=NULL)"}
+        transformation: "persisted verbatim via ChatMessageRepository.add_message (chat.py:210-213,321); admin sessions never load a current_vendor_id, so self.vendor_id is None and every row lands under the vendor_id IS NULL history bucket (repositories.py:761,788-791)"
+      - from: {component: admin, l1_id: null, parameter: "ChatMessage.content (prior history rows, vendor_id IS NULL)"}
+        to: {component: agent, l1_id: null, parameter: "input_messages (LLM context array)"}
+        transformation: "loaded via _load_history + system prompt concatenation (chat.py:339-343)"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.copilot.list_vendors", parameter: "(no arguments)"}
+        transformation: "LLM decides to enumerate; returns id/company_name/vendor_category/status/email/trust_level for EVERY vendor in the namespace, no filter argument possible or required"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.copilot.get_all_vendors_summary", parameter: "(no arguments)"}
+        transformation: "LLM decides to pull the aggregate; iterates every vendor in the namespace with no per-vendor restriction (l1_mcp.yaml notes)"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.copilot.get_pending_actions_summary", parameter: "(no arguments)"}
+        transformation: "LLM decides to pull pending vendor applications / unprocessed invoices / high-risk vendors across the whole namespace, no filter"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "vendor_id"}
+        transformation: "LLM-supplied vendor_id, no allowlist; prompted e.g. by a 'review compliance documents for vendor X' turn"
+      - from: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "response.documents[].content_text (full extracted FinDrive document text)"}
+        to: {component: agent, l1_id: null, parameter: "input_messages (function_call_output)"}
+        transformation: "full document content injected into context verbatim -- the module's own comment (admin_reports.py:6-8) flags this as the indirect-prompt-injection surface for report-generation flows"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.copilot.get_vendor_activity_report", parameter: "vendor_id"}
+        transformation: "LLM-supplied vendor_id; combines profile+invoices+payments+emails+documents for that one vendor into a single tool result, the richest cross-domain pull available to any agent"
+      - from: {component: agent, l1_id: "agent.copilot.get_all_vendors_summary / get_pending_actions_summary / get_vendor_compliance_docs / get_vendor_activity_report", parameter: "aggregated response text (now in context)"}
+        to: {component: agent, l1_id: null, parameter: "LLM-composed report markdown (not yet persisted)"}
+        transformation: "model freely drafts report content following the REPORT FORMAT section of the system prompt (chat.py:804-819) -- no structural validation binds report content to the underlying tool-result data"
+      - from: {component: agent, l1_id: null, parameter: "LLM-composed report markdown"}
+        to: {component: agent, l1_id: "agent.copilot.save_report", parameter: "title, content, report_type"}
+        transformation: "all three arguments LLM-composed and passed as the save_report tool call"
+      - from: {component: agent, l1_id: "agent.copilot.save_report", parameter: "content, report_type"}
+        to: {component: admin, l1_id: null, parameter: "FinDriveFile.content_text, FinDriveFile.file_type='report', FinDriveFile.folder_path='/reports', FinDriveFile.vendor_id=NULL"}
+        transformation: "written via FinDriveFileRepository.create_file (admin_reports.py:269-282); filename server-generated as '{report_type}_{timestamp}.md', content_text stored unchanged"
+      - from: {component: admin, l1_id: null, parameter: "FinDriveFile.id (server-generated on insert)"}
+        to: {component: agent, l1_id: "agent.copilot.save_report", parameter: "response.file_id, response.viewer_url"}
+        transformation: "returned to the LLM as '/admin/findrive#file-{id}' (admin_reports.py:289-296) and surfaced to the admin in the chat reply"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "mcp.finmail.list_inbox", parameter: "inbox, message_type, unread_only, limit"}
+        transformation: "LLM-chosen; system prompt suggests inbox='admin' for reading the admin inbox (chat.py:827) but this is guidance only, not enforced"
+      - from: {component: agent, l1_id: null, parameter: "input_messages (e.g. recipients identified via get_all_vendors_summary for bulk notifications)"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to, subject, body, cc, bcc"}
+        transformation: "LLM composes recipient list and content itself -- no ownership/allowlist re-check at this hop"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "mcp.systemutils.read_config", parameter: "filepath"}
+        transformation: "LLM-supplied free-form path string, used per the 'infrastructure audits' guidance in the system prompt (chat.py:799)"
+      - from: {component: agent, l1_id: null, parameter: "input_messages"}
+        to: {component: agent, l1_id: "agent.copilot.start_workflow", parameter: "description, vendor_id, invoice_id, attachment_file_ids"}
+        transformation: "same LLM-composed, unvalidated-vendor_id pattern as agent.vendor_chat.start_workflow (identical code path, l1_mcp.yaml:808) -- continues into chat.trigger_background_workflow; here there is no current_vendor_id at all to check against, since admin sessions never set one"
+      - from: {component: agent, l1_id: null, parameter: "full_response (assistant's streamed text)"}
+        to: {component: admin, l1_id: null, parameter: "ChatMessage.content (role=assistant, vendor_id=NULL)"}
+        transformation: "persisted after the model finishes responding (chat.py:483-484)"
+    preconditions: ["session:temporary is sufficient — reaching /admin/dashboard at all is the only 'precondition'"]
+    effect_state_transition: >
+      Same ChatMessage persistence pattern as vendor chat, but vendor_id IS NULL for all
+      rows (admin sessions never get vendor context loaded). Report-generation flows end
+      with save_report writing a new FinDriveFile (vendor_id=None, folder='/reports').
+    observable_evidence: ["SSE token stream; saved report visible via admin.api.findrive.list; any emails sent"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: "reachable by any session that simply visits /admin — no credential distinguishes an 'admin' from any other visitor (see l1_admin.yaml header)"}
+    source_ref: "finbot/agents/chat.py:731-1141"
+    notes: >
+      get_all_vendors_summary / get_pending_actions_summary / get_vendor_activity_report
+      aggregate across every vendor in the namespace with no per-vendor restriction — the
+      one deliberate cross-vendor-within-namespace capability in the whole platform,
+      gated only by which URL prefix the request happened to use.
+
+  - id: chat.trigger_background_workflow
+    semantic_operation: "Cause the interactive chat assistant to hand off to the autonomous orchestrator/specialized-agent pipeline"
+    business_objects: [Vendor, Invoice, AgentSession]
+    realizing_l1_ids:
+      - agent.vendor_chat.start_workflow
+      - agent.copilot.start_workflow
+      - agent.orchestrator.delegate_to_onboarding
+      - agent.orchestrator.delegate_to_invoice
+      - agent.orchestrator.delegate_to_fraud
+      - agent.orchestrator.delegate_to_payments
+      - agent.orchestrator.delegate_to_system_maintenance
+      - agent.orchestrator.delegate_to_communication
+    parameter_flow:
+      - from: {component: agent, l1_id: "agent.vendor_chat.start_workflow", parameter: "description"}
+        to: {component: agent, l1_id: null, parameter: "task_data['description'] (chat.py:231)"}
+        transformation: "LLM's own free-text description of the requested action, copied unchanged into task_data"
+      - from: {component: agent, l1_id: "agent.vendor_chat.start_workflow", parameter: "vendor_id"}
+        to: {component: agent, l1_id: null, parameter: "task_data['vendor_id'] (chat.py:232)"}
+        transformation: "LLM-supplied vendor_id copied unchanged -- NOT re-validated against session_context.current_vendor_id before being queued (chat.py:215-238; record effect_state_transition)"
+      - from: {component: agent, l1_id: "agent.vendor_chat.start_workflow", parameter: "invoice_id"}
+        to: {component: agent, l1_id: null, parameter: "task_data['invoice_id'] (chat.py:235-236)"}
+        transformation: "included only if truthy (`if invoice_id:`); otherwise the key is simply absent from task_data -- no explicit null-vs-absent distinction enforced downstream"
+      - from: {component: agent, l1_id: "agent.vendor_chat.start_workflow", parameter: "attachment_file_ids"}
+        to: {component: agent, l1_id: null, parameter: "task_data['attachment_file_ids'] (chat.py:237-238)"}
+        transformation: "LLM-supplied list of FinDrive file_ids, included only if truthy; not checked for existence or ownership at this hop"
+      - from: {component: agent, l1_id: "agent.copilot.start_workflow", parameter: "description, vendor_id, invoice_id, attachment_file_ids"}
+        to: {component: agent, l1_id: null, parameter: "task_data dict (identical construction, chat.py:215-238 shared by both assistants per l1_mcp.yaml:808)"}
+        transformation: "same unvalidated pass-through as the vendor-chat hops above; here there is no current_vendor_id at all on the admin session to check against"
+      - from: {component: agent, l1_id: null, parameter: "task_data dict (description/vendor_id/invoice_id/attachment_file_ids/parent_workflow_id)"}
+        to: {component: agent, l1_id: null, parameter: "BackgroundTasks.add_task(run_orchestrator_agent, task_data=..., session_context=..., workflow_id=child_workflow_id) (chat.py:229,240-245)"}
+        transformation: "queued as a FastAPI background job; session_context is the CALLER's session object (still carries the real current_vendor_id) but the orchestrator acts on task_data's own vendor_id/invoice_id/attachment_file_ids instead -- the two are never reconciled"
+      - from: {component: agent, l1_id: null, parameter: "task_data['description']"}
+        to: {component: agent, l1_id: null, parameter: "ChatMessage(role='system', content=f'Workflow started: {description}', workflow_id=child_workflow_id) (chat.py:264-270)"}
+        transformation: "the LLM-composed description is echoed back into the visible conversation as a system message before the orchestrator has actually run"
+      - from: {component: agent, l1_id: null, parameter: "run_orchestrator_agent(task_data, session_context, workflow_id) -- task_data['vendor_id']/['description']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_onboarding", parameter: "vendor_id, task_description"}
+        transformation: "orchestrator's own LLM selects this delegate when the description implies vendor review; vendor_id passes through unchanged from the chat-originated task_data -- same fan-out mechanics as vendor.onboard_new_vendor's parameter_flow (hops covering delegate_to_onboarding -> get_vendor_details -> update_vendor_status), not re-derived here"
+      - from: {component: agent, l1_id: null, parameter: "run_orchestrator_agent(task_data) -- task_data['invoice_id']/['attachment_file_ids']/['description']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_invoice", parameter: "invoice_id, task_description"}
+        transformation: "selected when the description implies invoice processing; invoice_id and (per orchestrator.py:464-467) attachment_file_ids forward unchanged from the chat-originated task_data, matching invoice.submit_and_autoprocess's chain"
+      - from: {component: agent, l1_id: null, parameter: "run_orchestrator_agent(task_data) -- task_data['vendor_id']/['description']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_fraud", parameter: "vendor_id, task_description"}
+        transformation: "selected when the description implies a fraud/compliance/risk review, or as a chained step of another recipe -- same fan-out documented in vendor.onboard_new_vendor and invoice.submit_and_autoprocess"
+      - from: {component: agent, l1_id: null, parameter: "run_orchestrator_agent(task_data) -- task_data['invoice_id']/['description']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_payments", parameter: "invoice_id, task_description"}
+        transformation: "selected when the description implies payment processing, continuing invoice.submit_and_autoprocess's approve->pay chain"
+      - from: {component: agent, l1_id: null, parameter: "run_orchestrator_agent(task_data) -- task_data['vendor_id']/['description']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_system_maintenance", parameter: "vendor_id (0 accepted for system-wide ops), task_description"}
+        transformation: "selected when the description implies infra/system-maintenance work; internally rewritten and routed through FraudComplianceAgent with SystemUtils MCP-tool instructions rather than a distinct agent class (l1_mcp.yaml agent.orchestrator.delegate_to_system_maintenance notes)"
+      - from: {component: agent, l1_id: null, parameter: "prior delegate's result.task_summary + task_data['vendor_id']/['description']"}
+        to: {component: agent, l1_id: "agent.orchestrator.delegate_to_communication", parameter: "vendor_id, task_description, notification_type, to_addresses, cc_addresses, bcc_addresses"}
+        transformation: "final step of most recipes, chained via _enrich_with_prior_context exactly as in vendor.onboard_new_vendor's parameter_flow; this delegate is what ultimately calls finmail__send_email, so a chat-originated, unvalidated vendor_id can end up driving an outbound email"
+    preconditions: ["a chat turn whose content the model interprets as requiring an action (re-review, invoice processing, etc.)"]
+    effect_state_transition: >
+      Schedules run_orchestrator_agent as a FastAPI BackgroundTasks job with
+      description/vendor_id/invoice_id/attachment_file_ids ALL CHOSEN BY THE LLM from the
+      conversation, not re-validated against the calling session's current_vendor_id
+      before being queued (finbot/agents/chat.py:215-278).
+    observable_evidence: ["a 'workflow_id' returned in the tool result; a system ChatMessage 'Workflow started: ...'; subsequent business events under that workflow_id"]
+    visibility: white_box_required
+    reachability: {status: black_box_reachable, notes: "reachable purely by asking the chat assistant to perform an action in natural language"}
+    source_ref: "finbot/agents/chat.py:215-278"
+    notes: "This is the single bridge point connecting the low-friction interactive chat surface to every state-changing background workflow in the platform."
+
+  # =========================================================================
+  # Communication / email
+  # =========================================================================
+
+  - id: communication.compose_via_portal
+    semantic_operation: "Manually compose and send an email through the vendor or admin portal UI (not agent-initiated)"
+    business_objects: [EmailMessage, Vendor]
+    realizing_l1_ids: [vendor.api.messages.send, admin.api.messages.send]
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.messages.send", parameter: "body.to, body.cc, body.bcc"}
+        to: {component: vendor, l1_id: null, parameter: "route_and_deliver(to, cc, bcc)"}
+        transformation: "passed unchanged as ComposeEmailRequest fields (vendor/routes/api.py:1095-1137) into route_and_deliver (finmail/routing.py:51-65); addresses are free-form, resolved with no allowlist"
+      - from: {component: vendor, l1_id: "vendor.api.messages.send", parameter: "body.subject, body.body"}
+        to: {component: vendor, l1_id: null, parameter: "route_and_deliver(subject, body)"}
+        transformation: "unchanged free text"
+      - from: {component: vendor, l1_id: null, parameter: "caller's authenticated session (session_context.current_vendor_id -> Vendor.email)"}
+        to: {component: vendor, l1_id: null, parameter: "route_and_deliver(from_address)"}
+        transformation: "from_addr looked up server-side from the vendor row owned by the session (api.py:1117-1120) and passed as from_address — not read from the request body, so the caller cannot spoof the sender"
+      - from: {component: vendor, l1_id: null, parameter: "route_and_deliver's per-recipient inbox_type resolution (vendor/admin/internal/external, routing.py:76-183)"}
+        to: {component: vendor, l1_id: null, parameter: "Email row (inbox_type, vendor_id, from_address, to_addresses, cc_addresses, bcc_addresses, subject, body)"}
+        transformation: "one Email row created per to/cc/bcc recipient via EmailRepository.create_email; recipients resolving outside the namespace directory land with inbox_type='external' and emit 'email.external_delivery'"
+      - from: {component: admin, l1_id: "admin.api.messages.send", parameter: "body.to, body.cc, body.bcc"}
+        to: {component: admin, l1_id: null, parameter: "route_and_deliver(to, cc, bcc)"}
+        transformation: "structurally identical to the vendor path — admin/routes/api.py:309-336 calls the same route_and_deliver with sender_type='admin'"
+      - from: {component: admin, l1_id: "admin.api.messages.send", parameter: "body.subject, body.body"}
+        to: {component: admin, l1_id: null, parameter: "route_and_deliver(subject, body)"}
+        transformation: "unchanged free text"
+      - from: {component: admin, l1_id: null, parameter: "caller's authenticated session (session_context.namespace)"}
+        to: {component: admin, l1_id: null, parameter: "route_and_deliver(from_address)"}
+        transformation: "from_addr computed server-side via get_admin_address(namespace) (api.py:318) — not read from the request body, cannot be spoofed by the caller"
+      - from: {component: admin, l1_id: null, parameter: "route_and_deliver's per-recipient inbox_type resolution"}
+        to: {component: admin, l1_id: null, parameter: "Email row (inbox_type, from_address, to_addresses, cc_addresses, bcc_addresses, subject, body)"}
+        transformation: "one Email row created per recipient; external resolutions emit 'email.external_delivery'"
+    preconditions: ["CSRF header required"]
+    effect_state_transition: >
+      route_and_deliver() resolves each recipient address to inbox_type
+      vendor/admin/internal/external and creates an Email row per recipient; sender
+      identity (from_address) is forced server-side and cannot be spoofed by the caller.
+    observable_evidence: ["Recipient's inbox view shows the new message; 'email.external_delivery' business event when any recipient resolves outside the namespace's known directory"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/mcp/servers/finmail/routing.py:51-190"
+    notes: ""
+
+  - id: communication.agent_initiated_notification
+    semantic_operation: "An agent (Communication Agent, chat assistant, or Co-Pilot) composes and sends an email on the platform's behalf"
+    business_objects: [EmailMessage, Vendor, Invoice]
+    realizing_l1_ids: [mcp.finmail.send_email, agent.communication.get_vendor_contact_info]
+    parameter_flow:
+      - from: {component: agent, l1_id: null, parameter: "arbitrary upstream LLM context (task description, prior agent_notes, or chat conversation the calling agent was given)"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to, subject, body, cc, bcc, message_type, sender_name, related_invoice_id"}
+        transformation: "the calling agent's own LLM composes every send_email argument from whatever context it currently holds — no structural binding to a specific verified data source (server.py:63-95)"
+      - from: {component: agent, l1_id: "agent.communication.get_vendor_contact_info", parameter: "response.email"}
+        to: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to"}
+        transformation: "one possible (not required) source the LLM may fold into the 'to' list among others available in its context — same pattern as the onboarding notification flow"
+      - from: {component: agent, l1_id: null, parameter: "caller's session (session_context.is_vendor_portal() -> vendor's own email, else get_admin_address(namespace))"}
+        to: {component: agent, l1_id: null, parameter: "route_and_deliver(from_address)"}
+        transformation: "from_addr forced server-side inside the send_email tool (server.py:101-108), independent of any LLM-chosen argument"
+      - from: {component: agent, l1_id: "mcp.finmail.send_email", parameter: "to, subject, body, cc, bcc"}
+        to: {component: agent, l1_id: null, parameter: "route_and_deliver's per-recipient inbox_type resolution (vendor/admin/internal/external)"}
+        transformation: "identical resolution logic to the manual-compose path (routing.py:51-190); no allowlist beyond namespace-directory lookups, so an LLM-steered address that fails to resolve internally lands as inbox_type='external'"
+      - from: {component: agent, l1_id: null, parameter: "route_and_deliver's resolved inbox_type"}
+        to: {component: agent, l1_id: null, parameter: "Email row (inbox_type, from_address, to_addresses, cc_addresses, bcc_addresses, subject, body)"}
+        transformation: "one Email row per recipient; external resolutions emit 'email.external_delivery'"
+    preconditions: ["the owning agent must have connected the finmail MCP server for this run"]
+    effect_state_transition: "Same route_and_deliver() resolution as the manual-compose path, but recipient list/subject/body/cc/bcc are entirely LLM-composed from whatever context (task description, prior agent notes, chat conversation) the agent was given."
+    observable_evidence: ["New Email row(s); 'email.external_delivery' event if any recipient resolves to inbox_type='external'"]
+    visibility: grey_box_required
+    reachability: {status: black_box_reachable, notes: "reachable end-to-end from any chat message or workflow that leads an agent to decide to send mail"}
+    source_ref: "finbot/mcp/servers/finmail/server.py:63-127"
+    notes: >
+      Because recipient resolution has no allowlist beyond namespace-directory lookups,
+      any address an agent is steered toward (via chat instruction, prior agent_notes, or
+      document content ingested per invoice.compliance_document_review) that fails to
+      resolve internally results in the message being delivered to inbox_type='external'
+      — an application-level fact about where agent-composed email content can end up,
+      independent of any scoring/detection layer.
+
+  # =========================================================================
+  # Document storage (FinDrive)
+  # =========================================================================
+
+  - id: findrive.store_and_retrieve_document
+    semantic_operation: "Store a document in FinDrive and later have an agent read its extracted text back into conversation/workflow context"
+    business_objects: [FinDriveFile, Invoice, Vendor]
+    realizing_l1_ids:
+      - vendor.api.findrive.create
+      - mcp.findrive.upload_file
+      - mcp.findrive.get_file
+      - agent.copilot.get_vendor_compliance_docs
+    parameter_flow:
+      - from: {component: vendor, l1_id: "vendor.api.findrive.create", parameter: "body.filename, body.content, body.folder, body.file_type"}
+        to: {component: vendor, l1_id: null, parameter: "FinDriveFile.filename, FinDriveFile.content_text, FinDriveFile.folder_path, FinDriveFile.file_type"}
+        transformation: "written verbatim via FinDriveFileRepository.create_file called directly from the REST handler (api.py:868-892) — this path BYPASSES the MCP upload_file tool's 500KB max_file_size_kb cap entirely, since no size check exists at the repository layer"
+      - from: {component: agent, l1_id: "mcp.findrive.upload_file", parameter: "filename, content, folder, vendor_id, file_type"}
+        to: {component: agent, l1_id: null, parameter: "FinDriveFile.filename, FinDriveFile.content_text, FinDriveFile.folder_path, FinDriveFile.vendor_id, FinDriveFile.file_type"}
+        transformation: "validated against max_file_size_kb (default 500KB, len(content.encode('utf-8'))) before insert (server.py:58-60) — the MCP path enforces the size cap that the REST path above skips; content stored as plain text, no binary/MIME handling"
+      - from: {component: vendor, l1_id: null, parameter: "FinDriveFile.content_text (written by either path above)"}
+        to: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "response.extracted_text"}
+        transformation: "read back verbatim, unchanged — a stored 'pdf' is just a text blob tagged file_type='pdf' (server.py:88-113), no binary/MIME reconstruction"
+      - from: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "response.extracted_text"}
+        to: {component: agent, l1_id: null, parameter: "calling agent's next-turn LLM context"}
+        transformation: "the full extracted_text becomes part of whatever agent called get_file's subsequent prompt context — instruction-channel-adjacent, comparable to the services-field injection in vendor.onboard_new_vendor"
+      - from: {component: vendor, l1_id: null, parameter: "FinDriveFile.content_text for every file matching the vendor"}
+        to: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "response (compliance doc content)"}
+        transformation: "full content_text of matching files pulled directly into the tool-call JSON returned to the LLM (admin_reports.py:129), flagged in-code as the indirect-prompt-injection surface for report-generation flows"
+      - from: {component: agent, l1_id: "agent.copilot.get_vendor_compliance_docs", parameter: "response (compliance doc content)"}
+        to: {component: agent, l1_id: null, parameter: "copilot/fraud agent's instruction-channel prompt context"}
+        transformation: "concatenated directly into the agent's LLM prompt rather than treated as inert tool output — same pattern as invoice.compliance_document_review"
+    preconditions: []
+    effect_state_transition: >
+      FinDriveFile row created with plain-text content (no binary/MIME handling anywhere
+      in the pipeline — a "PDF" is just a text blob tagged file_type='pdf'). Retrieval via
+      the MCP get_file tool returns full extracted_text directly into whatever agent
+      called it, becoming part of that agent's next-turn context.
+    observable_evidence: ["File visible in FinDrive UI/list endpoints; content appears verbatim in agent tool-call output logged to mcp_activity_log and the event stream"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/mcp/servers/findrive/server.py:1-12,44-114"
+    notes: >
+      The REST create route (vendor.api.findrive.create) bypasses the MCP upload_file
+      tool's 500KB size cap entirely, since it calls the repository directly
+      (finbot/apps/vendor/routes/api.py:868-892) — the cap only applies when a file is
+      created via the agent/MCP path.
+
+  - id: findrive.cross_vendor_file_access_via_agent
+    semantic_operation: "An agent (via the MCP findrive server) reads, lists, or deletes a FinDrive file belonging to a DIFFERENT vendor within the same namespace"
+    business_objects: [FinDriveFile, Vendor]
+    realizing_l1_ids: [mcp.findrive.get_file, mcp.findrive.delete_file, mcp.findrive.list_files, mcp.findrive.search_files]
+    parameter_flow:
+      - from: {component: agent, l1_id: null, parameter: "upstream conversation/task context supplying a file_id (or vendor_id) belonging to a sibling vendor in the same namespace"}
+        to: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "file_id"}
+        transformation: "LLM composes the file_id argument from whatever context it holds; not checked against the caller's current_vendor_id before the call is made"
+      - from: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "file_id"}
+        to: {component: agent, l1_id: null, parameter: "FinDriveFileRepository.get_file() authorization check"}
+        transformation: "the MCP-layer check only excludes files with vendor_id IS NULL (admin-scoped, server.py:102-103) — it does NOT compare f.vendor_id to session_context.current_vendor_id, unlike the equivalent REST route vendor.api.findrive.get, which enforces vendor_id==current_vendor_id at the repository layer"
+      - from: {component: agent, l1_id: null, parameter: "FinDriveFile row belonging to a different vendor in the same namespace (content_text, filename, vendor_id)"}
+        to: {component: agent, l1_id: "mcp.findrive.get_file", parameter: "response.extracted_text, response.filename, response.vendor_id"}
+        transformation: "returned in full to the calling agent despite belonging to a sibling vendor, becoming part of that agent's context — the authorization-boundary gap manifesting as a data leak"
+      - from: {component: agent, l1_id: "mcp.findrive.delete_file", parameter: "file_id"}
+        to: {component: agent, l1_id: null, parameter: "FinDriveFileRepository.delete_file() authorization check"}
+        transformation: "same vendor_id-IS-NULL-only check as get_file (server.py:156-157); permits irreversible deletion of a sibling vendor's file with no ownership comparison against the session"
+      - from: {component: agent, l1_id: "mcp.findrive.list_files", parameter: "vendor_id (caller-supplied, overrides the current_vendor_id default when nonzero)"}
+        to: {component: agent, l1_id: null, parameter: "FinDriveFileRepository.list_files(vendor_id) filter"}
+        transformation: "accepted as a plain LLM-suppliable argument (server.py:130-132) with no check that vendor_id belongs to the caller's own session"
+      - from: {component: agent, l1_id: null, parameter: "list_files/search_files query results across vendors in the namespace"}
+        to: {component: agent, l1_id: "mcp.findrive.list_files, mcp.findrive.search_files", parameter: "response.files / response.results"}
+        transformation: "list_files returns metadata for whatever vendor_id was requested with no ownership check; search_files (server.py:174-192) filters only to exclude vendor_id IS NULL, not to the caller's own vendor — both leak cross-vendor metadata within the namespace"
+    preconditions: ["namespace must contain more than one vendor; the acting agent must have findrive connected"]
+    effect_state_transition: "get_file/delete_file/list_files/search_files at the MCP layer only exclude files with vendor_id IS NULL (admin-scoped); they do NOT check the requesting session's current_vendor_id, unlike the equivalent REST routes (vendor.api.findrive.get/update/delete), which do."
+    observable_evidence: ["Tool-call output containing another vendor's document content or metadata, visible in mcp_activity_log / agent chat transcript"]
+    visibility: white_box_required
+    reachability: {status: black_box_reachable, notes: "reachable by asking an agent to look up or act on a file_id that belongs to a sibling vendor in the same namespace"}
+    source_ref: "finbot/mcp/servers/findrive/server.py:6-12,88-114,144-172"
+    notes: "Explicitly called out in the module's own docstring as deliberately left open, distinguishing this MCP-layer authorization posture from the stricter REST-layer one covering the same underlying table."
+
+  # =========================================================================
+  # MCP supply-chain (tool description control) — finbot/apps/darklab
+  # =========================================================================
+
+  - id: mcp_supply_chain.override_tool_description
+    semantic_operation: "Change the natural-language description of an MCP tool that gets presented to an LLM, for the caller's own namespace"
+    business_objects: [MCPToolDescription, AgentSession]
+    realizing_l1_ids:
+      - darklab.api.supply_chain.update_tool_overrides
+      - mcp.findrive.upload_file
+      - mcp.findrive.get_file
+      - mcp.finmail.send_email
+      - mcp.finstripe.create_transfer
+    parameter_flow:
+      - from: {component: darklab, l1_id: "darklab.api.supply_chain.update_tool_overrides", parameter: "body.tool_overrides[tool_name].description"}
+        to: {component: darklab, l1_id: null, parameter: "MCPServerConfig.tool_overrides_json"}
+        transformation: "ToolOverridesUpdate{tool_overrides: dict[str, dict]} JSON-serialized and written verbatim via MCPServerConfigRepository.update_tool_overrides (repositories.py:653-662), keyed to (namespace, server_type) from the path param; only the 'description' sub-key is ever later read back (argument-schema overrides may be stored but are never applied)"
+      - from: {component: darklab, l1_id: null, parameter: "MCPServerConfig.tool_overrides_json"}
+        to: {component: agent, l1_id: null, parameter: "create_mcp_server(server_type, session_context) -> tool_overrides dict"}
+        transformation: "at the NEXT create_mcp_server() call for that (server_type, namespace) — triggered by any subsequent agent/chat run — db_config.get_tool_overrides() (factory.py:83,98) JSON-decodes the stored value; unchanged"
+      - from: {component: agent, l1_id: null, parameter: "tool_overrides[tool_name].description"}
+        to: {component: agent, l1_id: null, parameter: "FastMCP tool object .description attribute (in-memory, pre-connect)"}
+        transformation: "_apply_tool_overrides (factory.py:38-62) calls provider.get_tool(tool_name) on the freshly-constructed FastMCP server and mutates tool.description = new_description IN PLACE, before any MCP client has connected to this server instance"
+      - from: {component: agent, l1_id: null, parameter: "FastMCP tool object .description (poisoned)"}
+        to: {component: agent, l1_id: null, parameter: "MCPToolProvider._tools[namespaced_name]['description']"}
+        transformation: "MCPToolProvider.connect() (finbot/mcp/provider.py:63-97) opens client.__aenter__() and calls client.list_tools(); the MCP protocol response for the tool now carries the mutated description (tool.description or ''), captured unchanged into the provider's internal tool map and into the tool_descriptions emitted on the 'mcp_tools_discovered' event (provider.py:95-111)"
+      - from: {component: agent, l1_id: null, parameter: "MCPToolProvider._tools[...]['description']"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer", parameter: "tools[].function.description (OpenAI-format tool schema presented to the LLM)"}
+        transformation: "unchanged; this is the exact text the LLM reads as the definition of finstripe__create_transfer on every turn of every agent/chat session in that namespace that connects the 'finstripe' server (e.g. the background PaymentsAgent before it decides whether/how to call create_transfer) — for as long as the override remains set, i.e. until mcp_supply_chain.reset_tool_overrides is invoked"
+      - from: {component: agent, l1_id: null, parameter: "same poisoned description, alternate consumers"}
+        to: {component: agent, l1_id: "mcp.findrive.upload_file | mcp.findrive.get_file | mcp.finmail.send_email", parameter: "tools[].function.description"}
+        transformation: "identical mechanism reaches any other tool named as a key in the same tool_overrides object in the same PUT call — findrive__upload_file, findrive__get_file, and finmail__send_email are poisoned the same way for VendorChatAssistant/CoPilotAssistant (which connect findrive and finmail) if their tool names are included in body.tool_overrides; only one downstream tool per PUT call is traced above (finstripe__create_transfer) for concreteness"
+    preconditions: ["CSRF header", "an MCPServerConfig row must already exist for (namespace, server_type) — auto-seeded on first visit to the MCP servers list"]
+    effect_state_transition: >
+      MCPServerConfig.tool_overrides_json updated for (namespace, server_type). Applied at
+      the NEXT create_mcp_server() call for that pair (finbot/mcp/factory.py:38-115):
+      the live FastMCP tool object's .description attribute is mutated in place BEFORE
+      any client connects, so MCPToolProvider.connect()'s client.list_tools() call
+      returns the poisoned description, which becomes the exact text the LLM sees for
+      that tool in its `tools` schema on every subsequent turn — for EVERY agent/chat
+      session in that namespace (vendor chat, admin Co-Pilot, and any orchestrator/
+      specialized agent that connects the same server_type), not just future darklab
+      visits.
+    observable_evidence: >
+      GET darklab.api.supply_chain.get_server_tools (or admin.api.mcp.get_server) reflects
+      the new description text; the next agent run's tool-call event log
+      (mcp.*.mcp_tools_discovered, finbot/mcp/provider.py:95-111) records the
+      tool_descriptions map actually presented to that run's LLM.
+    visibility: grey_box_required
+    reachability: {status: black_box_reachable, notes: "directly reachable via the Dark Lab UI/API with only a session cookie — no elevated credential exists to gate this"}
+    source_ref: "finbot/mcp/factory.py:38-115"
+    notes: >
+      Only the "description" key of the stored override object is ever applied — the
+      tool's JSON argument schema is never modified by this mechanism, regardless of what
+      is stored in tool_overrides_json.
+
+  - id: mcp_supply_chain.reset_tool_overrides
+    semantic_operation: "Clear all tool-description overrides for one MCP server back to its authored defaults, for the caller's own namespace"
+    business_objects: [MCPToolDescription]
+    realizing_l1_ids: [darklab.api.supply_chain.reset_tool_overrides]
+    parameter_flow:
+      - from: {component: darklab, l1_id: "darklab.api.supply_chain.reset_tool_overrides", parameter: "path.server_type (sole input; no request body)"}
+        to: {component: darklab, l1_id: null, parameter: "MCPServerConfig.tool_overrides_json"}
+        transformation: "MCPServerConfigRepository.reset_tool_overrides (repositories.py:673-680) sets tool_overrides_json = None for the row matching (namespace, server_type) — a pure trigger keyed only by the server_type path segment and the caller's namespace; no body parameter carries any data through this hop"
+      - from: {component: darklab, l1_id: null, parameter: "MCPServerConfig.tool_overrides_json = None"}
+        to: {component: agent, l1_id: null, parameter: "create_mcp_server() tool_overrides dict"}
+        transformation: "at the next create_mcp_server() call, db_config.get_tool_overrides() (factory.py:98, models.py:506-507) returns {} for a null column, so _apply_tool_overrides is skipped entirely and the FastMCP tool's .description reverts to whatever the server factory function (e.g. create_finstripe_server) originally authored it as"
+    preconditions: ["CSRF header"]
+    effect_state_transition: "MCPServerConfig.tool_overrides_json cleared to empty for (namespace, server_type)."
+    observable_evidence: ["Subsequent GET darklab.api.supply_chain.get_server_tools shows original descriptions"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/core/data/repositories.py:673"
+    notes: ""
+
+  - id: mcp_server.manage_operational_config
+    semantic_operation: "Enable/disable an MCP server, or tune its plain operational parameters, for the caller's own namespace"
+    business_objects: [MCPServerConfig, AgentSession]
+    realizing_l1_ids: [admin.api.mcp.update_server_config, admin.api.mcp.toggle_server]
+    parameter_flow:
+      - from: {component: admin, l1_id: "admin.api.mcp.update_server_config", parameter: "body.config (ServerConfigUpdate{config: dict}, e.g. {max_payment: ...} for finstripe or {max_file_size_kb: ...} for findrive)"}
+        to: {component: admin, l1_id: null, parameter: "MCPServerConfig.config_json"}
+        transformation: "JSON-serialized and written verbatim (overwriting the prior value, not merged at write time) via MCPServerConfigRepository.update_config (repositories.py:642-651), keyed to (namespace, server_type) from the path param"
+      - from: {component: admin, l1_id: null, parameter: "MCPServerConfig.config_json"}
+        to: {component: agent, l1_id: null, parameter: "create_mcp_server() server_config dict"}
+        transformation: "at the next create_mcp_server() call, db_config.get_config() (factory.py:83,97) JSON-decodes the stored dict and passes it as server_config to the per-type factory function"
+      - from: {component: agent, l1_id: null, parameter: "server_config dict"}
+        to: {component: agent, l1_id: "mcp.finstripe.create_transfer | mcp.findrive.upload_file", parameter: "runtime config = {**DEFAULT_CONFIG, **(server_config or {})}"}
+        transformation: "each factory function (e.g. finbot/mcp/servers/finstripe/server.py:43, finbot/mcp/servers/findrive/server.py:41) merges the stored config over that server's own DEFAULT_CONFIG; confirmed enforced example: findrive.max_file_size_kb gates upload_file's content-size check (findrive/server.py:58-60, 'File exceeds maximum size of {max_file_size_kb}KB'); finstripe.max_payment is present in FinStripe's DEFAULT_CONFIG/merged runtime config the same way but is not read by create_transfer's own validation logic (only 'amount <= 0' is checked) — included here as the record's own named example of a config key, not as a claim that it is enforced"
+      - from: {component: admin, l1_id: "admin.api.mcp.toggle_server", parameter: "path.server_type (sole input; no request body — toggle_enabled flips the existing boolean)"}
+        to: {component: admin, l1_id: null, parameter: "MCPServerConfig.enabled"}
+        transformation: "MCPServerConfigRepository.toggle_enabled (repositories.py:664-671) sets enabled = not enabled for the row matching (namespace, server_type)"
+      - from: {component: admin, l1_id: null, parameter: "MCPServerConfig.enabled = False"}
+        to: {component: agent, l1_id: null, parameter: "create_mcp_server() return value"}
+        transformation: "at the next create_mcp_server() call for that (server_type, namespace), the `if not db_config.enabled: return None` check (factory.py:88-95) fires before the factory function or tool-override logic ever runs — the agent that requested this server simply does not get it in its MCP server set, with no error surfaced; note this reads/writes the SAME MCPServerConfig row that mcp_supply_chain.override_tool_description acts on, but a different JSON column (config_json / enabled here vs tool_overrides_json there) via a different app (admin vs darklab) — see that record's factory.py trace for the tool_overrides_json path, not re-derived here"
+    preconditions: ["CSRF header"]
+    effect_state_transition: >
+      config_json merged over that server's DEFAULT_CONFIG (e.g. finstripe.max_payment,
+      findrive.max_file_size_kb, taxcalc.tax_rates, systemutils.mock_hostname,
+      finmail.max_results_per_query); toggling enabled=false makes
+      create_mcp_server() refuse to instantiate that server for ANY agent in the
+      namespace on their next run (returns None — the agent simply loses that tool set
+      silently rather than erroring).
+    observable_evidence: ["Config values reflected on GET admin.api.mcp.get_server; a disabled server's tools disappear from the next chat/workflow run's tool list"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/apps/admin/routes/api.py:157-190"
+    notes: "Operates on the SAME MCPServerConfig row as mcp_supply_chain.override_tool_description, via a different JSON column (config_json vs tool_overrides_json) and a different app (admin vs darklab)."
+
+  # =========================================================================
+  # Guardrail webhook (finbot/apps/labs)
+  # =========================================================================
+
+  - id: guardrail.configure_webhook
+    semantic_operation: "Register an outbound webhook to be notified around the caller's own agent model/tool calls"
+    business_objects: [GuardrailConfig]
+    realizing_l1_ids: [labs.api.guardrails.upsert_config, labs.api.guardrails.toggle_enabled, labs.api.guardrails.rotate_secret]
+    parameter_flow:
+      - from: {component: labs, l1_id: "labs.api.guardrails.upsert_config", parameter: "body.webhook_url"}
+        to: {component: labs, l1_id: null, parameter: "validate_webhook_url(url) [repositories.py:1297-1345]"}
+        transformation: "SSRF-hardening check: scheme must be http/https; hostname must not be 'metadata.google.internal'; outside DEBUG, 'localhost' and RFC1918/loopback/link-local IPs (_BLOCKED_NETWORKS) are rejected, and any non-80/443 port must fall in 1024-65535 — else ValueError -> 422"
+      - from: {component: labs, l1_id: "labs.api.guardrails.upsert_config", parameter: "body.webhook_url (post-validation)"}
+        to: {component: labs, l1_id: null, parameter: "LabsGuardrailConfig.webhook_url"}
+        transformation: "written verbatim by LabsGuardrailConfigRepository.upsert (repositories.py:1376-1424), scoped to (namespace, user_id)"
+      - from: {component: labs, l1_id: "labs.api.guardrails.upsert_config", parameter: "body.hooks"}
+        to: {component: labs, l1_id: null, parameter: "LabsGuardrailConfig.hooks_json"}
+        transformation: "keys validated against VALID_HOOK_KINDS={before_model,after_model,before_tool,after_tool} (unknown key -> ValueError/422); json.dumps'd verbatim; if omitted, defaults to all four kinds = True"
+      - from: {component: labs, l1_id: "labs.api.guardrails.upsert_config", parameter: "body.timeout_seconds, body.enabled"}
+        to: {component: labs, l1_id: null, parameter: "LabsGuardrailConfig.timeout_seconds, LabsGuardrailConfig.enabled"}
+        transformation: "timeout_seconds clamped to [1,30] via max(1,min(x,30)); enabled written verbatim"
+      - from: {component: labs, l1_id: null, parameter: "secrets.token_urlsafe(32) [repositories.py:1411, first-save-only]"}
+        to: {component: labs, l1_id: null, parameter: "LabsGuardrailConfig.signing_secret"}
+        transformation: "server-generated, only minted on the FIRST insert for this (namespace,user_id) — a subsequent PUT to an existing config leaves signing_secret untouched; POST /rotate-secret (labs.api.guardrails.rotate_secret) regenerates it the same way"
+      - from: {component: labs, l1_id: null, parameter: "LabsGuardrailConfig.signing_secret"}
+        to: {component: labs, l1_id: "labs.api.guardrails.upsert_config", parameter: "response.signing_secret"}
+        transformation: "read back and echoed in the PUT/GET/toggle/rotate response bodies (config.to_dict() + signing_secret injected, guardrails.py:55-56,78-79,95-96,112-113); this is the value later used to HMAC-sign every outbound hook POST — see guardrail.passive_hook_firing hop 2"
+      - from: {component: labs, l1_id: "labs.api.guardrails.toggle_enabled", parameter: "(no body — toggles existing row)"}
+        to: {component: labs, l1_id: null, parameter: "LabsGuardrailConfig.enabled"}
+        transformation: "flipped via `not config.enabled`; 404 if no config row exists yet for this (namespace,user_id)"
+    preconditions: ["CSRF header", "webhook_url must pass the SSRF-hardening validator (blocks localhost/metadata/RFC1918 outside DEBUG)"]
+    effect_state_transition: "LabsGuardrailConfig row upserted for (namespace, user_id); first save mints a signing_secret used to HMAC-sign every subsequent hook POST."
+    observable_evidence: ["GET labs.api.guardrails.get_config reflects saved state"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/core/data/repositories.py:1297-1394"
+    notes: ""
+
+  - id: guardrail.passive_hook_firing
+    semantic_operation: "The platform notifies a configured webhook before/after every model call and before/after every tool call the caller's agents make, without ever acting on the webhook's response"
+    business_objects: [GuardrailConfig, AgentSession]
+    realizing_l1_ids: [labs.api.guardrails.get_activity]
+    parameter_flow:
+      - from: {component: agent, l1_id: null, parameter: "tool_call_name, tool_call['arguments'] (base.py:145-157) OR name, arguments (chat.py:171-179) OR resolved_model, user_message_info['user_message'] (contextual_client.py:153-157) OR response.content (contextual_client.py:167-172)"}
+        to: {component: labs, l1_id: null, parameter: "GuardrailHookService.invoke(kind, tool_name=..., tool_arguments=..., model=..., user_message=..., model_output=...)"}
+        transformation: "real agent/tool/LLM activity forwarded unchanged into the hook call; before_tool/after_tool carry tool_name+tool_source+tool_arguments(+tool_result on after_tool); before_model/after_model carry model+user_message(+model_output on after_model) — gated by _is_hook_enabled(kind) reading LabsGuardrailConfig.enabled and hooks_json for this hook kind (service.py:66-71); if disabled/no config, invoke short-circuits and nothing is sent"
+      - from: {component: labs, l1_id: null, parameter: "HookEnvelope{hook_kind, session_id, workflow_id, tool_name, tool_source, tool_arguments, tool_result, model, user_message, model_output, timestamp}"}
+        to: {component: labs, l1_id: null, parameter: "body_bytes (envelope.model_dump_json().encode(), truncated to settings.LABS_GUARDRAIL_MAX_PAYLOAD_BYTES)"}
+        transformation: "serialized to JSON; HMAC-SHA256 signature computed over f'{timestamp}.'+body using LabsGuardrailConfig.signing_secret (the value minted in guardrail.configure_webhook) via _sign_payload (service.py:73-77,132)"
+      - from: {component: labs, l1_id: null, parameter: "body_bytes, X-Guardrail-Signature, X-Guardrail-Timestamp"}
+        to: {component: vendor, l1_id: null, parameter: "POST <LabsGuardrailConfig.webhook_url> (user-registered, attacker-controlled endpoint)"}
+        transformation: "httpx.AsyncClient POST with timeout=config.timeout_seconds (service.py:148-154); component modeled as 'vendor' in the sense of an external/user-supplied HTTP sink, not an L1-cataloged interaction"
+      - from: {component: vendor, l1_id: null, parameter: "response body (expected shape: WebhookVerdict{verdict: allow|block, reason})"}
+        to: {component: labs, l1_id: null, parameter: "parsed.verdict, parsed.reason (verdict_str, reason) OR outcome=invalid_verdict/error/timeout on failure"}
+        transformation: "parsed via WebhookVerdict.model_validate_json on HTTP 200; any other status -> HookOutcome.error, non-conforming JSON -> HookOutcome.invalid_verdict, no response within timeout -> HookOutcome.timeout"
+      - from: {component: labs, l1_id: null, parameter: "verdict_str (parsed webhook verdict, e.g. 'block')"}
+        to: {component: agent, l1_id: null, parameter: "(none — verdict is returned from invoke() as HookOutcome only; the calling agent/tool-execution code path in base.py:152-189, chat.py:171-202,364-394 and contextual_client.py:153-172 never inspects or branches on it)"}
+        transformation: "EXPLICITLY DISCARDED: invoke() docstring states callers must NOT branch on the outcome — tool execution, model calls, and the agent loop all proceed unconditionally regardless of an 'allow' or 'block' verdict; the verdict has zero effect on control flow, this is the central property of the record"
+      - from: {component: labs, l1_id: null, parameter: "kind, outcome, verdict_str, reason, latency_ms, http_status, error_detail, tool_name, tool_source, tool_arguments, model"}
+        to: {component: labs, l1_id: null, parameter: "event_data (dict) passed to event_bus.emit_agent_event(agent_name='guardrail', event_type=f'webhook_{outcome.value}', ...) [service.py:204-262]"}
+        transformation: "only outcome/verdict/reason/latency/tool_name/model metadata is persisted to the event store for later display — tool_result and model_output/user_message full bodies are NOT included in event_data, only tool_arguments/tool_name/model are"
+      - from: {component: labs, l1_id: null, parameter: "CTFEvent row (agent_name='guardrail')"}
+        to: {component: labs, l1_id: "labs.api.guardrails.get_activity", parameter: "response[] (ev.to_dict() per event)"}
+        transformation: "read back via CTFEventRepository.get_events(category='agent'), filtered client-side to agent_name=='guardrail' (guardrails.py:151-165); this is the only place the verdict becomes observable, purely as a log entry, never as an enforcement decision"
+    preconditions: ["config saved, enabled=true, and the specific hook_kind (before_model/after_model/before_tool/after_tool) toggled on"]
+    effect_state_transition: >
+      For every matching point in the agent loop (finbot/agents/base.py:152-189,
+      finbot/agents/chat.py:174-200,364-394, finbot/core/llm/contextual_client.py),
+      an HMAC-signed HTTP POST is sent to the registered webhook carrying tool
+      name/arguments/result or model input/output. THE RETURNED "allow"/"block" VERDICT
+      IS NEVER ACTED ON — this is explicit by design (finbot/guardrails/service.py:1-6,
+      91-95): "Never gates execution on the verdict... callers must NOT branch on the
+      outcome." Execution always proceeds regardless of what the webhook returns or
+      whether it responds at all.
+    observable_evidence: ["guardrail agent events (agent_name='guardrail') visible via labs.api.guardrails.get_activity, carrying outcome/verdict/latency/tool_name"]
+    visibility: white_box_required
+    reachability: {status: black_box_reachable, notes: "fires automatically on real agent activity once configured — no separate trigger needed"}
+    source_ref: "finbot/guardrails/service.py:1-6,79-202"
+    notes: >
+      Functionally this is an observability/notification feature, not an enforcement
+      control, despite exposing an allow/block verdict schema — worth documenting
+      explicitly since the schema's presence could otherwise be mistaken for a real gate.
+
+  - id: guardrail.test_webhook_delivery
+    semantic_operation: "Send a synthetic hook payload to the configured webhook to verify connectivity/signature handling"
+    business_objects: [GuardrailConfig]
+    realizing_l1_ids: [labs.api.guardrails.test_webhook]
+    parameter_flow:
+      - from: {component: labs, l1_id: "labs.api.guardrails.test_webhook", parameter: "(trigger only — no request body)"}
+        to: {component: labs, l1_id: null, parameter: "GuardrailHookService(session_context, workflow_id='wf_labs_test').invoke(HookKind.before_tool, tool_name='test_tool', tool_source='native', tool_arguments={'example_param':'hello_from_labs'})"}
+        transformation: "synthetic fixed values constructed server-side (guardrails.py:131-144), not derived from any real agent activity; workflow_id is a hardcoded literal, not a live workflow"
+      - from: {component: labs, l1_id: null, parameter: "signing_secret, webhook_url (from the caller's LabsGuardrailConfig, as configured in guardrail.configure_webhook)"}
+        to: {component: vendor, l1_id: null, parameter: "POST <webhook_url> with X-Guardrail-Signature/X-Guardrail-Timestamp, one-off HMAC-signed synthetic envelope"}
+        transformation: "same invoke() path as guardrail.passive_hook_firing (service.py:79-202): envelope built, signed, POSTed with config.timeout_seconds deadline"
+      - from: {component: vendor, l1_id: null, parameter: "webhook response ({verdict, reason} or error/timeout)"}
+        to: {component: labs, l1_id: "labs.api.guardrails.test_webhook", parameter: "response.outcome, response.message"}
+        transformation: "outcome.value returned directly as {'outcome': outcome.value, 'message': f'Hook fired with outcome: {outcome.value}'} (guardrails.py:145-148); verdict itself is not surfaced in this response, only the HookOutcome classification"
+      - from: {component: labs, l1_id: null, parameter: "same invoke() call as above"}
+        to: {component: labs, l1_id: "labs.api.guardrails.get_activity", parameter: "one new CTFEvent(agent_name='guardrail', event_type=f'webhook_{outcome.value}')"}
+        transformation: "logged exactly as any other hook firing would be, indistinguishable in the activity feed from a real before_tool event except for tool_name='test_tool' and workflow_id='wf_labs_test'; not persisted as chat/tool history"
+    preconditions: ["config saved and enabled, before_tool hook toggled on — else short-circuits with no network call"]
+    effect_state_transition: "One-off HMAC-signed POST with synthetic tool_name='test_tool' and fixed workflow_id='wf_labs_test'; not persisted as chat/tool history, only the resulting guardrail event is logged."
+    observable_evidence: ["Response body {outcome, message}; one new guardrail activity entry"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/apps/labs/routes/guardrails.py:131-148"
+    notes: ""
+
+  # =========================================================================
+  # Auth / session
+  # =========================================================================
+
+  - id: auth.bind_session_to_email
+    semantic_operation: "Upgrade an anonymous temporary session to a persistent, email-bound session via a magic link"
+    business_objects: [User, AgentSession]
+    realizing_l1_ids: [root.auth.magic_link_request, root.auth.magic_link_verify]
+    parameter_flow:
+      - from: {component: root, l1_id: "root.auth.magic_link_request", parameter: "email (Form body param)"}
+        to: {component: root, l1_id: null, parameter: "MagicLinkToken.email"}
+        transformation: "lowercased+stripped (auth.py:36), stored on a new MagicLinkToken row along with a fresh secrets.token_urlsafe(32) token and expires_at=now+MAGIC_LINK_EXPIRY_MINUTES; MagicLinkToken.session_id bound to the CURRENT session_context.session_id if one exists (anonymous/temporary session)"
+      - from: {component: root, l1_id: null, parameter: "MagicLinkToken.token"}
+        to: {component: root, l1_id: null, parameter: "magic_link URL = f'{MAGIC_LINK_BASE_URL}/auth/verify?token={token}'"}
+        transformation: "embedded in the emailed link via email_service.send_magic_link(email, magic_link) (auth.py:58-63); single-use token now the sole credential for the verify step"
+      - from: {component: root, l1_id: null, parameter: "magic_link_url (delivered out-of-band via email)"}
+        to: {component: root, l1_id: "root.auth.magic_link_verify", parameter: "token (query param)"}
+        transformation: "whoever clicks the link supplies token back verbatim; looked up against MagicLinkToken.token, validated not-used/not-expired via is_valid(), then marked used_at=now (auth.py:93-119) — single use enforced here"
+      - from: {component: root, l1_id: "root.auth.magic_link_verify", parameter: "magic_token.email, session_id_to_upgrade (current browser's session_id, else magic_token.session_id from hop 1)"}
+        to: {component: root, l1_id: null, parameter: "SessionManager.upgrade_to_permanent(session_id, email) [session.py:633-767]"}
+        transformation: "email re-lowercased+stripped; branches on whether a User with this email already exists"
+      - from: {component: root, l1_id: null, parameter: "upgrade_to_permanent — branch (a): no existing User for this email"}
+        to: {component: root, l1_id: "root.auth.magic_link_verify", parameter: "updated_context (same session_id, is_temporary=False, email bound)"}
+        transformation: "CURRENT temp session upgraded IN PLACE (session.py:703-759): UserSession.email/is_temporary/expires_at updated, session_data JSON re-signed via _sign_session_data, a new User row created via db.merge — any state accumulated on the anonymous session (current_vendor_id, prior chat/workflow context tied to this session_id) survives because the session row and its id are unchanged"
+      - from: {component: root, l1_id: null, parameter: "upgrade_to_permanent — branch (b): existing_user found for this email"}
+        to: {component: root, l1_id: "root.auth.magic_link_verify", parameter: "new_session (DIFFERENT session_id, freshly created via create_session)"}
+        transformation: "current_session row is db.delete()'d and committed (session.py:677-701) BEFORE a brand-new session is minted for the existing user — the original temp session_id is destroyed, so any anonymous-session-scoped state (e.g. current_vendor_id, in-flight agent workflow context keyed to the old session_id) is discarded, not merged; caller receives (new_session, is_existing_user=True)"
+      - from: {component: root, l1_id: "root.auth.magic_link_verify", parameter: "new_session.session_id (from whichever branch fired)"}
+        to: {component: root, l1_id: null, parameter: "Set-Cookie: <SESSION_COOKIE_NAME>=<session_id>; max_age=PERM_SESSION_TIMEOUT"}
+        transformation: "written to the redirect response (auth.py:174-184) and redirected to /portals; this cookie is the client's only signal of which branch fired — same session_id as before verify (branch a) vs. a new one (branch b)"
+    preconditions: ["possession of the emailed link's single-use token, unexpired"]
+    effect_state_transition: >
+      SessionManager.upgrade_to_permanent (finbot/core/auth/session.py:633-767): if the
+      email is new, the CURRENT session is upgraded in place (is_temporary=False,
+      email bound, PERM_SESSION_TIMEOUT applied); if the email already has an account,
+      the temp session is discarded and a fresh session for the existing user is created
+      instead (temp-session progress, e.g. any vendors registered anonymously, is lost in
+      that case).
+    observable_evidence: ["GET root.api.session_status (if present) shows is_temporary=false and the bound email/namespace afterward"]
+    visibility: black_box_observable
+    reachability: {status: black_box_reachable, notes: ""}
+    source_ref: "finbot/core/auth/session.py:633-767; finbot/apps/finbot/auth.py:84-198"
+    notes: "This is the ONLY state transition point from session:temporary to session:persistent in the entire platform."

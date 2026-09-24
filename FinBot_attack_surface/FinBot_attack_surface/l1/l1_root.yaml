@@ -1,0 +1,495 @@
+# L1 — root FastAPI app (finbot/main.py) and its directly-included routers.
+# Scope note: this dataset intentionally excludes the CTF game layer (finbot/apps/ctf/**,
+# finbot/ctf/** — challenges, badges, points, hints, leaderboard/profile gamification,
+# activity feed, "Hacker Toolkit" dead-drop/exfil views, share cards) and the CTF
+# marketing/participation pages under finbot/apps/finbot/routes.py (/, /portals,
+# /how-it-works, /about, /stats, /api/pulse, /agreement, /api/log-agreement). Those are
+# the scoring/gamification wrapper OWASP built AROUND the target, not the target itself.
+# This file covers only the platform infrastructure that the actual vulnerable
+# application (vendor portal, admin portal, agentic backend) depends on:
+#   - finbot.apps.finbot.auth   (magic-link sign-in, /auth/*)
+#   - finbot.core.websocket.routes (/ws/*)
+#   - finbot.apps.web.routes   (CineFlow demo tenant, mounted at /demo/cineflow)
+#   - static/introspection surfaces
+# Schema: FinBot_attack_surface/schema/L1_schema.yaml
+# component = "root" for all records in this file.
+# Cross-cutting facts that apply to every record below unless noted otherwise:
+#   - SessionMiddleware (finbot/core/auth/middleware.py:19) runs on every request except
+#     /static/* and /favicon.ico; it silently mints a temporary session (finbot_session
+#     cookie, HttpOnly+Secure+SameSite=Lax, 7-day Max-Age) for any request with no/invalid
+#     cookie, then stores SessionContext on request.state.session_context.
+#   - portal_type on that context is set purely from the URL prefix (startswith("/admin")
+#     or startswith("/vendor")) — it is a UI label, not a credential check
+#     (finbot/core/auth/middleware.py:44-47).
+#   - CSRFProtectionMiddleware (finbot/core/auth/csrf.py) requires header
+#     settings.CSRF_HEADER_NAME to match session_context.csrf_token on every
+#     POST/PUT/DELETE/PATCH, EXCEPT paths starting with: /api/health, /api/status,
+#     /static/, /favicon.ico, /auth/, /ws/test/, /api/log-agreement, /cc/.
+#   - Security headers observed live on every response: X-Content-Type-Options: nosniff,
+#     X-Frame-Options: DENY, X-XSS-Protection: 1; mode=block. No CSP header observed.
+#     No rate-limit headers observed on any probed endpoint.
+#   - Live black-box confirmed 2026-09-19 against https://owasp-finbot-ctf.org/.
+
+records:
+  - id: root.api.healthz
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /healthz
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 200 {'status':'ok'}, live"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {black_box: "GET /healthz -> 200 {status: ok}", source_ref: "finbot/main.py:215-218"}
+    notes: "Liveness probe for the Railway deployment, not app-specific."
+
+  - id: root.api.session_status
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /api/session/status
+    ui_trigger: null
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: dependency
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 200, live"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence:
+      black_box: >
+        GET /api/session/status -> 200 {session_id (truncated), user_id, is_temporary,
+        namespace, security_status:{rotation_count,time_since_rotation,session_age,
+        should_rotate,is_too_old,suspicious_activity,fingerprint_protected}, csrf_token}.
+        This is the only endpoint that hands the CSRF token to a client explicitly —
+        every other page must scrape it from an embedded meta tag / hidden field
+        (finbot/core/auth/csrf.py:182-207, csrf_token_meta/csrf_token_field).
+      source_ref: "finbot/main.py:222-234"
+    notes: "user_id and namespace fully disclosed (namespace = f\"ns_user_{user_id}\", the actual DB partition key used by every NamespacedRepository filter)."
+
+  - id: root.api.test_404
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /test/404
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "dev/test scaffolding, present in prod build"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:89-92"}
+    notes: "Deliberately raises HTTPException to exercise render_error_page(). Siblings: /test/403, /test/400, /test/500, /test/503, /api/test/404, /api/test/500 — same pattern, same file."
+
+  - id: root.api.test_403
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /test/403
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:95-98"}
+    notes: "Renders the 403 error template — same template family as the CSRF-failure page (403_csrf.html)."
+
+  - id: root.api.test_400
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /test/400
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:101-104"}
+    notes: ""
+
+  - id: root.api.test_500
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /test/500
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:107-110"}
+    notes: ""
+
+  - id: root.api.test_503
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /test/503
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:113-116"}
+    notes: ""
+
+  - id: root.api.test_404_json
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /api/test/404
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:119-122"}
+    notes: "JSON-error-response variant (path starts with /api/ so error_handlers renders JSON, not an HTML error page)."
+
+  - id: root.api.test_500_json
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /api/test/500
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/routes.py:125-128"}
+    notes: ""
+
+  # -------------------------------------------------------------------------
+  # Auth: magic-link sign-in (finbot/apps/finbot/auth.py, prefix /auth)
+  # -------------------------------------------------------------------------
+
+  - id: root.auth.check_email
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /auth/check-email
+    ui_trigger: "Redirect target after submitting the sign-in email form"
+    parameters:
+      - {name: email, location: query, type: string, required: false, source: "raw query param, echoed into template"}
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "listed in root openapi.json"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/auth.py:232-242"}
+    notes: "Redirects to /portals if the caller is already authenticated (_is_authenticated check)."
+
+  - id: root.auth.magic_link_request
+    component: root
+    interaction_type: http_route
+    method: POST
+    path: /auth/magic-link
+    ui_trigger: "Sign-in form ('Enter your email') on /portals or nav sign-in button"
+    parameters:
+      - {name: email, location: body, type: string, required: true, source: "Body_request_magic_link_auth_magic_link_post (application/x-www-form-urlencoded, FastAPI Form(...))"}
+    auth_requirement: none
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "form-encoded POST, exempt from CSRF (/auth/ prefix)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/auth.py:27-81"}
+    notes: >
+      Creates a MagicLinkToken row (32-byte urlsafe token, expires_at =
+      now + MAGIC_LINK_EXPIRY_MINUTES) bound to the CURRENT session_id if one exists.
+      Sends the link via finbot.core.email.get_email_service().send_magic_link — no
+      rate limiting or per-email throttling observed in source. No account-existence
+      signal is leaked in the response (always redirects to /auth/check-email).
+
+  - id: root.auth.magic_link_verify
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /auth/verify
+    ui_trigger: "Link clicked from the emailed magic-link message"
+    parameters:
+      - {name: token, location: query, type: string, required: true, source: "raw query param, looked up against MagicLinkToken.token"}
+    auth_requirement: none
+    authz_check_location: in_handler
+    state_preconditions: ["token not yet used, not expired (MagicLinkToken.is_valid())"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/auth.py:84-198"}
+    notes: >
+      On success, upgrades the session tied to token.session_id (or the current
+      browser's session, preferring the current one — see comment at auth.py:121-128)
+      to a persistent (is_temporary=False) session bound to the token's email via
+      SessionManager.upgrade_to_permanent, then sets a fresh session cookie with
+      PERM_SESSION_TIMEOUT and redirects to /portals. This is the one state
+      transition point where session:temporary -> session:persistent occurs.
+
+  - id: root.auth.logout
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /auth/logout
+    ui_trigger: "'Sign out' link/button"
+    parameters: []
+    auth_requirement: session:temporary
+    authz_check_location: dependency
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/finbot/auth.py:201-229"}
+    notes: "GET (not POST) despite being a state-changing action — deletes the UserSession row and immediately mints a brand-new temporary session, then redirects to /portals."
+
+  # -------------------------------------------------------------------------
+  # WebSocket (finbot/core/websocket/routes.py, prefix /ws)
+  # -------------------------------------------------------------------------
+
+  - id: root.ws.health
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /ws/health
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/core/websocket/routes.py:17-20"}
+    notes: ""
+
+  - id: root.ws.test_push
+    component: root
+    interaction_type: http_route
+    method: POST
+    path: /ws/test/push
+    ui_trigger: null
+    parameters:
+      - {name: namespace, location: body, type: string, required: true, source: "TestEventRequest"}
+      - {name: user_id, location: body, type: string, required: true, source: "TestEventRequest"}
+      - {name: event_type, location: body, type: string, required: true, source: "TestEventRequest — must match a WSEventType enum value"}
+      - {name: data, location: body, type: object, required: false, source: "TestEventRequest"}
+    auth_requirement: none
+    authz_check_location: in_handler
+    state_preconditions: ["settings.DEBUG must be true, else 404 (finbot/core/websocket/routes.py:35-36)"]
+    reachability: {status: blocked_by_control, notes: "gated on DEBUG flag; presumed false in the production deployment (not independently confirmed live to avoid pushing test events to arbitrary user_id/namespace pairs)"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/core/websocket/routes.py:23-54; exempt path '/ws/test/' in csrf.py:35"}
+    notes: >
+      Lets a caller push an arbitrary WSEvent to any (namespace, user_id) pair with
+      no ownership check when DEBUG=true — a debug-only fan-out test hook, not
+      reachable in a properly configured deployment.
+
+  - id: root.ws.connect
+    component: root
+    interaction_type: websocket
+    method: WS
+    path: /ws/connect
+    ui_trigger: "Opened automatically by every portal page's JS on load, to receive live activity/score/badge toasts"
+    parameters:
+      - {name: namespace, location: query, type: string, required: true, source: "raw query param on the WS upgrade request — NOT cross-checked against the session cookie's own namespace"}
+      - {name: user_id, location: query, type: string, required: true, source: "raw query param on the WS upgrade request — NOT cross-checked against the session cookie's own user_id"}
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "not independently opened live; confirmed from source only"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/core/websocket/routes.py:57-121; finbot/core/websocket/manager.py"}
+    notes: >
+      Not present in openapi.json (WS routes never are) — only discoverable by
+      reading the frontend JS bundle or source. CSRFProtectionMiddleware explicitly
+      skips any request with an 'upgrade: websocket' header (csrf.py:50-52), and
+      SessionMiddleware does the same (middleware.py:27-29), so this path is outside
+      both cross-cutting controls. After connect, client can send JSON
+      {"action":"subscribe"|"unsubscribe","topic":...} or {"action":"ping"}.
+
+  # -------------------------------------------------------------------------
+  # CineFlow demo tenant (finbot/apps/web/routes.py, mounted at /demo/cineflow)
+  # Dormant fictional-company microsite, explicitly "preserved for future IPI
+  # scenarios" per its module docstring — currently static content only, no
+  # agent/LLM wiring observed.
+  # -------------------------------------------------------------------------
+
+  - id: root.demo.cineflow_home
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /demo/cineflow/
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "curl 307 -> /demo/cineflow/ -> presumed 200"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {black_box: "GET /demo/cineflow -> 307 redirect to /demo/cineflow/", source_ref: "finbot/apps/web/routes.py:16-19; finbot/main.py:178"}
+    notes: "Not linked from any nav observed; only reachable by knowing the exact path (hence white_box_required for discovery, though black_box_reachable once known)."
+
+  - id: root.demo.cineflow_about
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /demo/cineflow/about
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/web/routes.py:22-25"}
+    notes: ""
+
+  - id: root.demo.cineflow_work
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /demo/cineflow/work
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/web/routes.py:28-31"}
+    notes: ""
+
+  - id: root.demo.cineflow_partners
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /demo/cineflow/partners
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/web/routes.py:34-37"}
+    notes: ""
+
+  - id: root.demo.cineflow_careers
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /demo/cineflow/careers
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/web/routes.py:40-43"}
+    notes: ""
+
+  - id: root.demo.cineflow_contact
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /demo/cineflow/contact
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/apps/web/routes.py:46-49"}
+    notes: ""
+
+  # -------------------------------------------------------------------------
+  # Static assets & introspection surfaces (not FastAPI routes, but discoverable)
+  # -------------------------------------------------------------------------
+
+  - id: root.static.mount
+    component: root
+    interaction_type: static_asset
+    method: GET
+    path: /static/{path}
+    ui_trigger: null
+    parameters: [{name: path, location: path, type: string, required: true, source: "StaticFiles path traversal-safe resolver"}]
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "starlette StaticFiles serving finbot/static/"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {source_ref: "finbot/main.py:158"}
+    notes: "CSS/JS/image bundle — primary black-box source for discovering AJAX call shapes/paths that aren't linked from server-rendered HTML."
+
+  - id: root.introspection.docs_root
+    component: root
+    interaction_type: http_route
+    method: GET
+    path: /docs
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "FastAPI's default Swagger UI is enabled and unauthenticated on the root app"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {black_box: "GET /docs -> 200 text/html; GET /openapi.json -> 200 application/json (confirmed 2026-09-19)"}
+    notes: >
+      Every mounted sub-app also exposes its own /{prefix}/docs and
+      /{prefix}/openapi.json (vendor: 33 paths, admin: 22, darklab: 15, labs: 8 — all
+      confirmed 200 live) EXCEPT /cc, which returns 403 for both /cc/docs and
+      /cc/openapi.json (custom access-guard middleware runs ahead of the
+      OpenAPI/Swagger routes for that sub-app only). This is the single richest
+      black-box discovery source on the vulnerable application — it fully enumerates
+      every in-scope HTTP L1 record in this dataset without any credentials.
+
+  - id: root.introspection.robots_txt
+    component: root
+    interaction_type: static_asset
+    method: GET
+    path: /robots.txt
+    ui_trigger: null
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "returns 404 — no robots.txt is served"}
+    visibility: black_box_observable
+    controls_observed: {csrf: false, rate_limited: false, security_headers: true}
+    evidence: {black_box: "GET /robots.txt -> 404 (confirmed 2026-09-19)"}
+    notes: "Absence noted for completeness; not a disclosure source on this deployment."

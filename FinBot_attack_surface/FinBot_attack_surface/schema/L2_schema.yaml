@@ -40,18 +40,20 @@ fields:
       chat), and one L1 record (POST /vendor/api/v1/chat) can realize many
       different L2 operations depending on payload content.
 
-  actor_model:
+  parameter_flow:
     status: added
-    type: object {performs, affects}
+    type: list[{from: {component, l1_id, parameter}, to: {component, l1_id, parameter}, transformation}]
     desc: >
-      Who initiates the operation vs who is harmed/benefits. Ordinary CRUD
-      threat modeling assumes these are the same actor; agentic apps break
-      that assumption routinely — e.g. in "Double Agent"
-      (finbot/ctf/definitions/challenges/data_exfiltration/double_agent.yaml)
-      an admin-role action (editing a tool description) is what performs
-      the operation, but the fraud_agent (acting on behalf of the platform)
-      is what actually triggers the harmful effect, later and in an
-      unrelated request.
+      Directed, per-hop trace of the values this operation passes across
+      components and endpoints. `component` uses the L1.component value;
+      `l1_id` references the L1 interaction where the value is read or
+      received/sent (null for an internal component hop with no L1
+      interaction); `parameter` names the field or argument at that point.
+      Add one item for each handoff, including intermediate hops, so the
+      list shows the path from source to consumer. `transformation`
+      describes what happens to the value on that hop (e.g. renamed,
+      validated, serialized, or unchanged).
+
 
   preconditions:
     status: modified
@@ -69,27 +71,6 @@ fields:
       emitted, email sent, agent memory/context updated, tool description
       mutated.
 
-  trust_boundary_crossing:
-    status: added
-    type: enum [immediate, delayed_agent_mediated, none]
-    desc: >
-      immediate = effect happens synchronously within the triggering
-      request/response. delayed_agent_mediated = the operation plants
-      attacker-influenced state that an AI agent later reads and acts on
-      in a *different* request, on someone else's behalf, crossing a trust
-      boundary the agent doesn't realize it's crossing. This is the core
-      mechanic of most challenges under
-      finbot/ctf/definitions/challenges/{data_exfiltration,rce,destructive}
-      and has no analogue in the original ASA cheat sheet, which assumes a
-      direct caller -> handler relationship.
-
-  operation_dependencies:
-    status: modified
-    type: list[string]
-    desc: >
-      Ordering/prerequisite chain. Maps directly onto the `prerequisites:`
-      field already used in this repo's challenge YAML, reused verbatim
-      rather than reinvented.
 
   observable_evidence:
     status: modified
@@ -106,12 +87,6 @@ fields:
       one, and where it exists it's just a stronger-than-usual instance of
       "evidence," not a different kind of fact.
 
-  taxonomy_labels:
-    status: added
-    type: object {owasp_llm, owasp_agentic, cwe, mitre_atlas}
-    desc: >
-      Passed through from the challenge YAML `labels:` block where one
-      exists, rather than inventing a parallel category scheme.
 
   visibility:
     status: added
@@ -143,12 +118,3 @@ fields:
   notes:
     status: added
     type: string
-
-removed_from_asa_baseline:
-  - field: "generic 'data flow across trust boundary' narrative field"
-    reason: >
-      Split into two typed fields (effect_state_transition +
-      trust_boundary_crossing) because the free-text version doesn't
-      distinguish "boundary crossed once, synchronously" from "boundary
-      crossed later, by a different actor" — a distinction that determines
-      whether black-box testing alone can ever surface the finding.

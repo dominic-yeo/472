@@ -1,0 +1,1417 @@
+# L1 — Interaction-level attack surface for Lunary (self-hosted)
+# Target: http://localhost:8080/ (Next.js frontend) + http://localhost:3333 (Koa API backend)
+# Scope: the intended vulnerable application only (Lunary LLM observability/prompt platform).
+#        CTF harness / scoring scaffolding is deliberately excluded.
+# Credentials used for grey/white-box confirmation: user_b@exploit.com (org "TechNova", role admin).
+#
+# Deployment topology (confirmed black-box):
+#   - :8080  Next.js SSR/SPA. Serves pages + static bundle. Almost all data access happens
+#            browser-side by calling the API directly at NEXT_PUBLIC_API_URL (:3333).
+#            Only three legacy paths are rewritten through :8080 (next.config.js rewrites):
+#            POST /api/report, POST /api/v1/report, GET /api/v1/template -> :3333.
+#   - :3333  Koa API. Middleware order: sentry -> error -> logger -> CORS -> authMiddleware
+#            -> ratelimit -> bodyParser -> setDefaultBody. Routers: redirections, /v1, /auth,
+#            /webhooks. CORS reflects Origin and allows credentials.
+#
+# auth_requirement vocabulary used here:
+#   none                : matched by publicRoutes allowlist in auth/utils.ts (no JWT needed).
+#   session:jwt         : valid HS256 JWT (from /auth/login|signup|reset) in Authorization: Bearer.
+#                         Carries {userId, orgId, email}. (== schema's session:persistent tier.)
+#   project-scoped      : a project UUID presented as the Bearer token (SDK/ingest style) OR as
+#                         ?projectId=; authMiddleware copies it into ctx.state.projectId. On JWT
+#                         requests the project is verified to belong to the caller's org; on public
+#                         routes it is trusted as-is.
+#   role:admin          : org-level admin, checked inside the handler (not in middleware).
+#
+# authz_check_location legend: middleware | dependency | in_handler | repository_layer | none
+#   (repository_layer = the only tenant scoping is a `where project_id=`/`org_id=` clause in SQL.)
+
+components:
+  frontend:   { prefix: "http://localhost:8080",       stack: "Next.js (pages router, Mantine UI)" }
+  api:        { prefix: "http://localhost:3333/v1",     stack: "Koa + koa-router + postgres.js" }
+  auth:       { prefix: "http://localhost:3333/auth",   stack: "Koa" }
+  webhooks:   { prefix: "http://localhost:3333/webhooks", stack: "Koa (Stripe)" }
+  legacy:     { prefix: "http://localhost:3333",        stack: "redirections router (SDK back-comcompat)" }
+
+interactions:
+
+  # ============================================================ AUTH ==========
+  - id: auth.signup
+    component: auth
+    interaction_type: http_route
+    method: POST
+    path: /auth/signup
+    ui_trigger: "/signup page (Sign up form)"
+    parameters:
+      - {name: email, location: body, type: string(email), required: true, source: zod bodySchema}
+      - {name: password, location: body, type: string(min6), required: true, source: zod bodySchema}
+      - {name: name, location: body, type: string, required: true, source: zod bodySchema}
+      - {name: orgName, location: body, type: string, required: false, source: zod bodySchema}
+      - {name: projectName, location: body, type: string, required: false, source: zod bodySchema}
+      - {name: employeeCount, location: body, type: string, required: false, source: zod bodySchema}
+      - {name: orgId, location: body, type: string, required: false, source: zod bodySchema}
+      - {name: signupMethod, location: body, type: "enum[signup,join]", required: true, source: zod bodySchema}
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions:
+      - "email must not already exist in account table"
+      - "signupMethod=join uses caller-supplied orgId directly (no invite token verified)"
+    reachability: {status: black_box_reachable, notes: "public; creates org+account+project+api_keys, returns JWT"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence:
+      black_box: "reachable at :3333; login of the seeded account succeeds (200 + token)"
+      source_ref: "packages/backend/src/api/v1/auth/index.ts:14"
+    notes: >
+      signupMethod=join sets role=member, verified=true and trusts body.orgId — an org-membership
+      join path that does not consume an invitation token. Weak SSRF-ish guard only blocks
+      orgName containing 'https://' / name containing 'http://'.
+
+  - id: auth.login
+    component: auth
+    interaction_type: http_route
+    method: POST
+    path: /auth/login
+    ui_trigger: "/login page"
+    parameters:
+      - {name: email, location: body, type: string(email), required: true, source: zod bodySchema}
+      - {name: password, location: body, type: string, required: true, source: zod bodySchema}
+    auth_requirement: none
+    authz_check_location: in_handler
+    state_preconditions: ["account row exists with a bcrypt/argon2 passwordHash"]
+    reachability: {status: black_box_reachable, notes: "issues 1-month HS256 JWT {userId,email,orgId}"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence:
+      black_box: "POST returns {token: <JWT>}; JWT payload decodes to userId/orgId/email"
+      source_ref: "packages/backend/src/api/v1/auth/index.ts:150"
+
+  - id: auth.request_password_reset
+    component: auth
+    interaction_type: http_route
+    method: POST
+    path: /auth/request-password-reset
+    ui_trigger: "/request-password-reset page"
+    parameters:
+      - {name: email, location: body, type: string, required: true, source: "raw ctx.request.body (no zod)"}
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: ["signs a 1h JWT {email}; writes it to account.recovery_token; emails reset link"]
+    reachability: {status: black_box_reachable, notes: "always returns {} / {ok:true}; no user enumeration"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/auth/index.ts:180"}
+
+  - id: auth.reset_password
+    component: auth
+    interaction_type: http_route
+    method: POST
+    path: /auth/reset-password
+    ui_trigger: "/reset-password?token= , /update-password pages"
+    parameters:
+      - {name: token, location: body, type: string(JWT), required: true, source: zod bodySchema}
+      - {name: password, location: body, type: string, required: true, source: zod bodySchema}
+    auth_requirement: none
+    authz_check_location: in_handler
+    state_preconditions: ["token must be a JWT verifiable with JWT_SECRET; email taken from token payload"]
+    reachability: {status: black_box_reachable, notes: "sets account.password_hash for token.email, returns new JWT"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/auth/index.ts:207"}
+    notes: "Accepts any JWT with an {email} claim signed by JWT_SECRET; does not check recovery_token match."
+
+  # ============================================================ USERS =========
+  - id: api.users.me
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/users/me
+    ui_trigger: "app shell (loads current user)"
+    parameters: []
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "returns id,name,email,verified for ctx.state.userId"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a (bearer)", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: "200 with authenticated token", source_ref: "packages/backend/src/api/v1/users.ts:70"}
+
+  - id: api.users.me_org
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/users/me/org
+    ui_trigger: "app shell / team page (org + member list)"
+    parameters: []
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "org row + all accounts in org (id,name,email,role)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence:
+      black_box: 'returns {"name":"TechNova","plan":"unlimited",...,"users":[{...role:admin}]}'
+      source_ref: "packages/backend/src/api/v1/users.ts:12"
+
+  - id: api.users.verify_email
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/users/verify-email
+    ui_trigger: "email link"
+    parameters: [{name: token, location: query, type: string(JWT), required: true, source: query}]
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: ["token JWT carrying {email}"]
+    reachability: {status: black_box_reachable, notes: "sets account.verified=true for token.email; 302 to APP_URL"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/users.ts:96"}
+
+  - id: api.users.send_verification
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/users/send-verification
+    ui_trigger: "resend-verification button"
+    parameters:
+      - {name: email, location: body, type: string(email), required: true, source: zod}
+      - {name: name, location: body, type: string, required: true, source: zod}
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "sends verification email to arbitrary address"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/users.ts:131"}
+
+  - id: api.users.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/users/:userId
+    ui_trigger: "/team page member click"
+    parameters: [{name: userId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "where id=:userId AND org_id=caller org"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/users.ts:144"}
+
+  - id: api.users.remove
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/users/:userId
+    ui_trigger: "/team page remove-member action"
+    parameters: [{name: userId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: role:admin
+    authz_check_location: in_handler
+    state_preconditions: ["caller.role=='admin'", "target user in same org (checked in handler)"]
+    reachability: {status: black_box_reachable, notes: "sets account.org_id=NULL (soft-remove)"}
+    visibility: grey_box_required
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/users.ts:160"}
+    notes: "Method PATCH performs a remove-from-org; role check is the only guard."
+
+  # ============================================================ ORGS ==========
+  - id: api.orgs.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/orgs/:orgId
+    ui_trigger: "billing / settings pages"
+    parameters: [{name: orgId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "IGNORES :orgId path param; queries ctx.state.orgId from JWT"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/orgs.ts:17"}
+    notes: "Returns stripe_customer/subscription among fields. Path :orgId is decorative — all orgs.* use JWT orgId."
+
+  - id: api.orgs.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/orgs/:orgId
+    ui_trigger: "/settings org rename"
+    parameters:
+      - {name: orgId, location: path, type: uuid, required: true, source: path}
+      - {name: name, location: body, type: string, required: true, source: zod}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update org set name where id=JWT.orgId"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/orgs.ts:41"}
+
+  - id: api.orgs.usage
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/orgs/:orgId/usage
+    ui_trigger: "billing usage chart"
+    parameters:
+      - {name: orgId, location: path, type: uuid, required: true, source: path}
+      - {name: projectId, location: query, type: uuid, required: false, source: query}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "daily run counts; project filter optional"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/orgs.ts:53"}
+
+  - id: api.orgs.billing_portal
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/orgs/:orgId/billing-portal
+    ui_trigger: "/billing 'Manage subscription'"
+    parameters: [{name: orgId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["org.stripe_customer set", "STRIPE keys configured"]
+    reachability: {status: conditionally_mounted, notes: "depends on Stripe config; returns portal URL"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/orgs.ts:88"}
+
+  - id: api.orgs.upgrade
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/orgs/:orgId/upgrade
+    ui_trigger: "/billing plan buttons"
+    parameters:
+      - {name: plan, location: body, type: string, required: true, source: raw body}
+      - {name: period, location: body, type: string, required: true, source: raw body}
+      - {name: origin, location: body, type: string, required: true, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["Stripe configured; matching price lookup_key plan_period"]
+    reachability: {status: conditionally_mounted, notes: "creates Stripe checkout/subscription"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/orgs.ts:110"}
+    notes: "success_url/cancel_url built from caller-supplied `origin`."
+
+  - id: api.orgs.playground
+    component: api
+    interaction_type: sse_stream
+    method: POST
+    path: /v1/orgs/:orgId/playground
+    ui_trigger: "/prompts Playground 'Run' button"
+    parameters:
+      - {name: content, location: body, type: "array (chat messages)", required: true, source: zod}
+      - {name: extra, location: body, type: "object (model,temperature,max_tokens,tools,functions,stop,seed,...)", required: true, source: zod}
+      - {name: variables, location: body, type: "record<string,string>", required: true, source: zod}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["org.play_allowance > 0", "OPENAI/ANTHROPIC/OPENROUTER key configured for chosen model"]
+    reachability: {status: conditionally_mounted, notes: "SSE text/event-stream; needs an LLM provider key to actually stream"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence:
+      black_box: "org play_allowance observed = 20 (via /users/me/org)"
+      source_ref: "packages/backend/src/api/v1/orgs.ts:210 ; utils/playground.ts:runAImodel"
+    notes: >
+      Primary LLM egress point. content+variables are compiled ({{var}} substitution) then sent to
+      OpenAI/Anthropic/OpenRouter with caller-controlled model params, tools and functions. See L2
+      vendor-independent operation api.playground.run.
+
+  # ============================================================ PROJECTS ======
+  - id: api.projects.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/projects
+    ui_trigger: "project switcher"
+    parameters: []
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "lists org projects INCLUDING public + private api keys"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence:
+      black_box: "returns [{name:'TechNova Chatbot', publicApiKey, privateApiKey}, ...]"
+      source_ref: "packages/backend/src/api/v1/projects/index.ts:9"
+
+  - id: api.projects.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/projects
+    ui_trigger: "'New project'"
+    parameters: [{name: name, location: body, type: string, required: true, source: zod}]
+    auth_requirement: session:jwt
+    authz_check_location: in_handler
+    state_preconditions: ["plan!=free OR <2 projects (free-plan cap checked in handler)"]
+    reachability: {status: black_box_reachable, notes: "creates project + public(apiKey=projectId)+private api keys"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/projects/index.ts:34"}
+
+  - id: api.projects.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/projects/:projectId
+    ui_trigger: "/settings delete project"
+    parameters: [{name: projectId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["org must retain >=1 project"]
+    reachability: {status: black_box_reachable, notes: "delete where id=:projectId (count guard is org-wide, not ownership)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/projects/index.ts:70"}
+    notes: "DELETE filters only on project id, not org_id (org scoping absent at repository layer here)."
+
+  - id: api.projects.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/projects/:projectId
+    ui_trigger: "/settings rename project"
+    parameters:
+      - {name: projectId, location: path, type: uuid, required: true, source: path}
+      - {name: name, location: body, type: string, required: true, source: zod}
+    auth_requirement: session:jwt
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update project set name where id=:projectId (no org_id clause)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/projects/index.ts:97"}
+
+  # ============================================================ RUNS ==========
+  - id: api.runs.ingest
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/runs/ingest
+    ui_trigger: "null (SDK/tracer only)"
+    parameters:
+      - {name: Authorization, location: header, type: "Bearer <projectId UUID>", required: false, source: "authMiddleware -> ctx.state.projectId"}
+      - {name: projectId, location: query, type: uuid, required: false, source: query}
+      - {name: events, location: body, type: "Event | Event[] (llm|chain|agent|tool|log|chat|thread|...)", required: true, source: "raw body -> cleanEvent"}
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: ["projectId resolvable from bearer/query; public route (no JWT)"]
+    reachability: {status: black_box_reachable, notes: "core telemetry sink; writes run/log/external_user/thread rows"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/ingest.ts:284 ; utils/ingest.ts"}
+    notes: >
+      Trust boundary: external SDKs push arbitrary run/agent/tool/chat trace data keyed only by a
+      project UUID (also the public API key). userId in events auto-creates external_user rows.
+
+  - id: api.runs.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/runs
+    ui_trigger: "/logs table (filters, search, export)"
+    parameters:
+      - {name: projectId, location: query, type: uuid, required: true, source: "ctx.state.projectId"}
+      - {name: "<serialized filter logic>", location: query, type: "querystring (deserializeLogic)", required: false, source: "shared.deserializeLogic -> convertChecksToSQL"}
+      - {name: limit, location: query, type: int, required: false, source: query}
+      - {name: page, location: query, type: int, required: false, source: query}
+      - {name: parentRunId, location: query, type: uuid, required: false, source: query}
+      - {name: exportType, location: query, type: "enum[csv,jsonl]", required: false, source: query}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["projectId belongs to caller org (verified in middleware for JWT)"]
+    reachability: {status: black_box_reachable, notes: "returns runs; exportType streams CSV/JSONL file"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence:
+      black_box: "GET /v1/runs?projectId=<uuid> returns 200 with authenticated token"
+      source_ref: "packages/backend/src/api/v1/runs/index.ts:62 ; utils/filters.ts:convertChecksToSQL"
+    notes: >
+      The raw querystring is parsed into filter logic and compiled to SQL fragments per CHECK_RUNNER.
+      This is the main structured user-input -> SQL data flow in the app (see L2 api.runs.query).
+
+  - id: api.runs.usage
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/runs/usage
+    ui_trigger: "/analytics dashboards"
+    parameters:
+      - {name: projectId, location: query, type: uuid, required: true, source: ctx.state}
+      - {name: days, location: query, type: int, required: true, source: query}
+      - {name: userId, location: query, type: int, required: false, source: query}
+      - {name: daily, location: query, type: bool, required: false, source: query}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "token/cost aggregates"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/index.ts:143"}
+
+  - id: api.runs.get_public
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/runs/:id/public
+    ui_trigger: "/traces/:id shared link"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: none
+    authz_check_location: repository_layer
+    state_preconditions: ["run.is_public = true"]
+    reachability: {status: black_box_reachable, notes: "public read of a run marked is_public"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/index.ts:206"}
+
+  - id: api.runs.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/runs/:id
+    ui_trigger: "/logs/:id , /traces/:id"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "scoped by org (project_id in caller-org projects)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/index.ts:229"}
+
+  - id: api.runs.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/runs/:id
+    ui_trigger: "/logs/:id (toggle public, edit tags/feedback)"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: isPublic, location: body, type: bool, required: false, source: raw body}
+      - {name: feedback, location: body, type: string, required: false, source: raw body}
+      - {name: tags, location: body, type: string[], required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update where project_id=state.projectId AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/index.ts:253"}
+
+  - id: api.runs.related
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/runs/:id/related
+    ui_trigger: "/traces/:id tree view"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "recursive CTE over parent_run_id; NO project/org filter"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/index.ts:274"}
+    notes: "Authenticated but not tenant-scoped: walks the run tree by id alone."
+
+  - id: api.runs.feedback
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/runs/:id/feedback
+    ui_trigger: "null (SDK getFeedback)"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: none
+    authz_check_location: repository_layer
+    state_preconditions: ["projectId from bearer/query"]
+    reachability: {status: black_box_reachable, notes: "public route (regex /v1/runs/.+/feedback)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/runs/index.ts:296"}
+
+  # ============================================================ DATASETS ======
+  # NOTE: publicRoutes contains regex /v1/datasets/.+ -> every /v1/datasets/<sub> path is treated
+  #       as a public route by authMiddleware (JWT not required; projectId taken from bearer/query).
+  - id: api.datasets.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/datasets
+    ui_trigger: "/datasets index"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "exact /v1/datasets (no trailing seg) still needs JWT"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:14"}
+
+  - id: api.datasets.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/datasets/:identifier
+    ui_trigger: "/datasets/:id ; SDK getDataset(slug)"
+    parameters: [{name: identifier, location: path, type: "uuid|slug", required: true, source: path}]
+    auth_requirement: project-scoped
+    authz_check_location: repository_layer
+    state_preconditions: ["uuid -> getDatasetById; else -> getDatasetBySlug; scoped by projectId"]
+    reachability: {status: black_box_reachable, notes: "public per datasets regex"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:23"}
+
+  - id: api.datasets.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/datasets
+    ui_trigger: "/datasets/new"
+    parameters: [{name: slug, location: body, type: string, required: true, source: zod}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "creates dataset + default prompt + variation"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:64"}
+
+  - id: api.datasets.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/datasets/:id
+    ui_trigger: "/datasets/:id rename"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: slug, location: body, type: string, required: true, source: raw body}
+    auth_requirement: project-scoped
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update where id AND project_id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:90"}
+
+  - id: api.datasets.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/datasets/:id
+    ui_trigger: "/datasets/:id delete"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "delete where id ONLY (no project_id / org scoping)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:104"}
+    notes: "Public route + no tenant scoping on delete."
+
+  - id: api.datasets.prompt.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/datasets/prompts
+    ui_trigger: "/datasets/:id add prompt"
+    parameters:
+      - {name: datasetId, location: body, type: uuid, required: true, source: raw body}
+      - {name: messages, location: body, type: "array (chat messages)", required: false, source: raw body}
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "insert dataset_prompt for caller-supplied datasetId"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:115"}
+
+  - id: api.datasets.prompt.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/datasets/prompts/:id
+    ui_trigger: "/datasets/:id prompt editor"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "prompt + variations by id (no project scoping)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:138"}
+
+  - id: api.datasets.prompt.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/datasets/prompts/:id
+    ui_trigger: "/datasets/:id delete prompt"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "delete prompt + its variations by id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:152"}
+
+  - id: api.datasets.prompt.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/datasets/prompts/:id
+    ui_trigger: "/datasets/:id edit prompt messages"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: messages, location: body, type: "array/string", required: true, source: raw body}
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update dataset_prompt.messages by id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:161"}
+
+  - id: api.datasets.variation.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/datasets/variations/:id
+    ui_trigger: "/datasets/:id variation editor"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "variation by id (no scoping)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:173"}
+
+  - id: api.datasets.variation.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/datasets/variations/:id
+    ui_trigger: "/datasets/:id delete variation"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "delete variation by id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:185"}
+
+  - id: api.datasets.variation.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/datasets/variations/:variationId
+    ui_trigger: "/datasets/:id edit variation (variables/context/idealOutput)"
+    parameters:
+      - {name: variationId, location: path, type: uuid, required: true, source: path}
+      - {name: variables, location: body, type: object, required: false, source: raw body}
+      - {name: context, location: body, type: string, required: false, source: raw body}
+      - {name: idealOutput, location: body, type: string, required: false, source: raw body}
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update variation by id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:193"}
+
+  - id: api.datasets.variation.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/datasets/variations
+    ui_trigger: "/datasets/:id add variation"
+    parameters:
+      - {name: promptId, location: body, type: uuid, required: true, source: raw body}
+      - {name: variables, location: body, type: object, required: false, source: raw body}
+      - {name: context, location: body, type: string, required: false, source: raw body}
+      - {name: idealOutput, location: body, type: string, required: false, source: raw body}
+    auth_requirement: project-scoped
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "insert variation for caller-supplied promptId"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/datasets/index.ts:214"}
+
+  # ============================================================ RADARS ========
+  - id: api.radars.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/radars
+    ui_trigger: "/radars index"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["seeds DEFAULT_RADARS on first access for the project"]
+    reachability: {status: black_box_reachable, notes: "radars + pass/fail counts"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/radars.ts:170"}
+
+  - id: api.radars.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/radars/:radarId
+    ui_trigger: "/radars detail"
+    parameters: [{name: radarId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "scoped by project_id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/radars.ts:196"}
+
+  - id: api.radars.chart
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/radars/:radarId/chart
+    ui_trigger: "/radars chart"
+    parameters: [{name: radarId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "7-day pass/fail series"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/radars.ts:213"}
+
+  - id: api.radars.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/radars
+    ui_trigger: "/radars new"
+    parameters:
+      - {name: description, location: body, type: string, required: true, source: raw body}
+      - {name: view, location: body, type: "array (filter logic)", required: true, source: raw body}
+      - {name: checks, location: body, type: "array (filter logic)", required: true, source: raw body}
+      - {name: negative, location: body, type: bool, required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "stores view/checks logic evaluated later by radar job"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/radars.ts:249"}
+    notes: "view/checks are filter-logic trees later compiled to SQL by the radar batch job (utils/filters + checks)."
+
+  - id: api.radars.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/radars/:radarId
+    ui_trigger: "/radars edit"
+    parameters:
+      - {name: radarId, location: path, type: uuid, required: true, source: path}
+      - {name: description/view/checks/negative, location: body, type: mixed, required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update where id AND project_id; clears radar_result"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/radars.ts:271"}
+
+  - id: api.radars.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/radars/:radarId
+    ui_trigger: "/radars delete"
+    parameters: [{name: radarId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "delete where id AND project_id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/radars.ts:305"}
+
+  # ============================================================ TEMPLATES =====
+  - id: api.templates.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/templates
+    ui_trigger: "/prompts sidebar list"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "templates + versions (json_agg)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templates.ts:9"}
+
+  - id: api.templates.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/templates
+    ui_trigger: "/prompts new template"
+    parameters:
+      - {name: slug, location: body, type: string, required: true, source: raw body}
+      - {name: mode, location: body, type: string, required: true, source: raw body}
+      - {name: content, location: body, type: "array (messages)", required: true, source: raw body}
+      - {name: extra, location: body, type: object, required: false, source: raw body}
+      - {name: testValues, location: body, type: object, required: false, source: raw body}
+      - {name: isDraft, location: body, type: bool, required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "creates template + first template_version"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templates.ts:33"}
+
+  - id: api.templates.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/templates/:id
+    ui_trigger: "/prompts/:id"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "where project_id AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templates.ts:75"}
+
+  - id: api.templates.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/templates/:id
+    ui_trigger: "/prompts/:id delete"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "delete where project_id AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templates.ts:83"}
+
+  - id: api.templates.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/templates/:id
+    ui_trigger: "/prompts/:id rename/mode"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: slug, location: body, type: string, required: true, source: raw body}
+      - {name: mode, location: body, type: string, required: true, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update where project_id AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templates.ts:91"}
+
+  - id: api.templates.version.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/templates/:id/versions
+    ui_trigger: "/prompts/:id save new version"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: content, location: body, type: "array (messages)", required: true, source: raw body}
+      - {name: extra, location: body, type: object, required: false, source: raw body}
+      - {name: testValues, location: body, type: object, required: false, source: raw body}
+      - {name: isDraft, location: body, type: bool, required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "insert template_version for :id (no project check)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templates.ts:116"}
+
+  # ==================================================== TEMPLATE VERSIONS =====
+  - id: api.template_versions.latest
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/template_versions/latest
+    ui_trigger: "null (SDK fetches latest prompt by slug)"
+    parameters:
+      - {name: slug, location: query, type: string, required: true, source: query}
+      - {name: projectId, location: query/bearer, type: uuid, required: true, source: ctx.state.projectId}
+    auth_requirement: project-scoped
+    authz_check_location: repository_layer
+    state_preconditions: ["is_draft=false version exists for slug in project"]
+    reachability: {status: black_box_reachable, notes: "public route; SDK entry to resolve prompt content"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templateVersions.ts:16"}
+
+  - id: api.template_versions.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/template_versions/:id
+    ui_trigger: "/prompts version view"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "version by id; template re-scoped by project_id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templateVersions.ts:45"}
+
+  - id: api.template_versions.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/template_versions/:id
+    ui_trigger: "/prompts save version edits"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: content, location: body, type: "array (messages)", required: true, source: raw body}
+      - {name: extra, location: body, type: object, required: false, source: raw body}
+      - {name: testValues, location: body, type: object, required: false, source: raw body}
+      - {name: isDraft, location: body, type: bool, required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update template_version by id ONLY (no project/org scoping)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/templateVersions.ts:60"}
+
+  # ============================================================ FILTERS =======
+  - id: api.filters.models
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/filters/models
+    ui_trigger: "/logs filter dropdown (models)"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "model_name_cache for project"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/filters.ts:9"}
+
+  - id: api.filters.tags
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/filters/tags
+    ui_trigger: "/logs filter dropdown (tags)"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "tag_cache for project"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/filters.ts:26"}
+
+  - id: api.filters.feedbacks
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/filters/feedbacks
+    ui_trigger: "/logs filter dropdown (feedback)"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "distinct feedback shapes for project"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/filters.ts:43"}
+
+  - id: api.filters.users
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/filters/users
+    ui_trigger: "/logs filter dropdown (users)"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "external_user id/label for project"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/filters.ts:90"}
+
+  - id: api.filters.radars
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/filters/radars
+    ui_trigger: "/logs filter dropdown (radars)"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "radar id/description for project"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/filters.ts:107"}
+
+  # =========================================================== EXT USERS ======
+  - id: api.external_users.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/external-users
+    ui_trigger: "/users index"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "external_user rows + summed cost, project-scoped"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/external-users.ts:9"}
+
+  - id: api.external_users.runs_usage
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/external-users/runs/usage
+    ui_trigger: "/users usage"
+    parameters:
+      - {name: projectId, location: query, type: uuid, required: true, source: ctx.state}
+      - {name: days, location: query, type: int, required: false, source: query}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "per-user token/cost aggregates"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/external-users.ts:40"}
+
+  - id: api.external_users.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/external-users/:id
+    ui_trigger: "/users/:id"
+    parameters: [{name: id, location: path, type: int, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "select * from external_user where id=:id (no project/org scoping)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/external-users.ts:78"}
+    notes: "Authenticated but not tenant-scoped; :id is a sequential int."
+
+  # ========================================================= EVALUATIONS ======
+  - id: api.evaluations.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/evaluations
+    ui_trigger: "/evaluations/new 'Run evaluation'"
+    parameters:
+      - {name: name, location: body, type: string, required: false, source: raw body}
+      - {name: datasetId, location: body, type: uuid, required: true, source: raw body}
+      - {name: checklistId, location: body, type: uuid, required: true, source: raw body}
+      - {name: models, location: body, type: string[], required: true, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: ["LLM provider key configured (runEval calls runAImodel per prompt x variation x model)"]
+    reachability: {status: conditionally_mounted, notes: "fan-out LLM calls; needs provider key to complete"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/evaluations/index.ts:12 ; evaluations/utils.ts:runEval"}
+
+  - id: api.evaluations.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/evaluations/:id
+    ui_trigger: "/evaluations/:id"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "where id AND project_id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/evaluations/index.ts:57"}
+
+  - id: api.evaluations.result
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/evaluations/result/:evaluationId
+    ui_trigger: "/evaluations/:id results table"
+    parameters: [{name: evaluationId, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "results by evaluationId ONLY (no project/org scoping)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/evaluations/index.ts:70"}
+
+  - id: api.evaluations.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/evaluations
+    ui_trigger: "/evaluations index"
+    parameters: [{name: projectId, location: query, type: uuid, required: true, source: ctx.state}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "evaluations for project"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/evaluations/index.ts:88"}
+
+  - id: api.evaluations.run
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/evaluations/run
+    ui_trigger: "null (SDK lunary.evaluate)"
+    parameters:
+      - {name: checklist, location: body, type: "string (checklist slug)", required: true, source: raw body}
+      - {name: input, location: body, type: any, required: true, source: raw body}
+      - {name: output, location: body, type: any, required: true, source: raw body}
+      - {name: idealOutput, location: body, type: string, required: false, source: raw body}
+      - {name: context, location: body, type: string, required: false, source: raw body}
+      - {name: model, location: body, type: string, required: false, source: raw body}
+      - {name: duration, location: body, type: number, required: false, source: raw body}
+    auth_requirement: none
+    authz_check_location: repository_layer
+    state_preconditions: ["checklist slug exists in projectId (from bearer/query)"]
+    reachability: {status: black_box_reachable, notes: "public route; builds virtual run and runs checks (some checks call AI graders)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/evaluations/index.ts:94 ; checks/runChecks.ts"}
+    notes: "input/output flow into runChecksOnRun; AI-backed checks (sentiment/tone/factualness/...) re-egress to an LLM."
+
+  # ========================================================== CHECKLISTS ======
+  - id: api.checklists.list
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/checklists
+    ui_trigger: "/evaluations/checklists"
+    parameters:
+      - {name: projectId, location: query, type: uuid, required: true, source: ctx.state}
+      - {name: type, location: query, type: string, required: true, source: query}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "checklists by project+type"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/checklists.ts:11"}
+
+  - id: api.checklists.get
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/checklists/:id
+    ui_trigger: "/evaluations/checklists editor"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "where project_id AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/checklists.ts:24"}
+
+  - id: api.checklists.create
+    component: api
+    interaction_type: http_route
+    method: POST
+    path: /v1/checklists
+    ui_trigger: "/evaluations/checklists new"
+    parameters:
+      - {name: slug, location: body, type: string, required: true, source: raw body}
+      - {name: type, location: body, type: string, required: true, source: raw body}
+      - {name: data, location: body, type: "FilterLogic (filter/check tree)", required: true, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "stores check logic later run by evaluations.run / eval"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/checklists.ts:35"}
+
+  - id: api.checklists.update
+    component: api
+    interaction_type: http_route
+    method: PATCH
+    path: /v1/checklists/:id
+    ui_trigger: "/evaluations/checklists edit"
+    parameters:
+      - {name: id, location: path, type: uuid, required: true, source: path}
+      - {name: slug, location: body, type: string, required: false, source: raw body}
+      - {name: data, location: body, type: FilterLogic, required: false, source: raw body}
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "update where project_id AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/checklists.ts:54"}
+
+  - id: api.checklists.delete
+    component: api
+    interaction_type: http_route
+    method: DELETE
+    path: /v1/checklists/:id
+    ui_trigger: "/evaluations/checklists delete"
+    parameters: [{name: id, location: path, type: uuid, required: true, source: path}]
+    auth_requirement: session:jwt
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "delete where project_id AND id"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/checklists.ts:70"}
+
+  # ============================================================ MISC / SYS =====
+  - id: api.v1.root
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/
+    ui_trigger: "null"
+    parameters: []
+    auth_requirement: session:jwt
+    authz_check_location: middleware
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "static 'Lunary API v1' (not in publicRoutes, needs token)"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/index.ts:20"}
+
+  - id: api.v1.health
+    component: api
+    interaction_type: http_route
+    method: GET
+    path: /v1/health
+    ui_trigger: "null (uptime probe)"
+    parameters: []
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "'Ok' if db reachable"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: "GET :3333/v1/health -> 200 Ok", source_ref: "packages/backend/src/api/v1/index.ts:24"}
+
+  - id: webhooks.stripe
+    component: webhooks
+    interaction_type: http_route
+    method: POST
+    path: /webhooks/stripe
+    ui_trigger: "null (Stripe callback)"
+    parameters:
+      - {name: stripe-signature, location: header, type: string, required: true, source: header}
+      - {name: "<event body>", location: body, type: "raw (constructEventAsync verified)", required: true, source: rawBody}
+    auth_requirement: none
+    authz_check_location: in_handler
+    state_preconditions: ["STRIPE_WEBHOOK_SECRET set; valid HMAC signature"]
+    reachability: {status: conditionally_mounted, notes: "public route but signature-gated; mutates org plan/subscription"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a (signature)", rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/webhooks/stripe.ts:170"}
+
+  - id: legacy.report
+    component: legacy
+    interaction_type: http_route
+    method: POST
+    path: /api/report
+    ui_trigger: "null (legacy SDK ingest) — also rewritten via :8080/api/report and /api/v1/report"
+    parameters:
+      - {name: events, location: body, type: "Event|Event[]", required: true, source: raw body}
+      - {name: projectId/app, location: body, type: uuid, required: true, source: "events[0].projectId || events[0].app"}
+    auth_requirement: none
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "alias of runs.ingest; projectId taken from body, no auth"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/redirections.ts:8"}
+
+  - id: legacy.template
+    component: legacy
+    interaction_type: http_route
+    method: GET
+    path: /api/v1/template
+    ui_trigger: "null (legacy SDK) — rewritten via :8080/api/v1/template"
+    parameters:
+      - {name: slug, location: query, type: string, required: true, source: query}
+      - {name: app_id, location: query, type: uuid, required: true, source: query}
+    auth_requirement: none
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "server-side refetch of template_versions/latest with app_id as bearer"}
+    visibility: black_box_observable
+    controls_observed: {csrf: none, rate_limited: true, security_headers: minimal}
+    evidence: {black_box: null, source_ref: "packages/backend/src/api/v1/redirections.ts:26"}
+
+  # ======================================================= FRONTEND (UI) ======
+  # Next.js pages on :8080. These are the discoverable UI triggers; each drives one or more of the
+  # api.* interactions above via the browser fetcher (utils/fetcher.ts -> NEXT_PUBLIC_API_URL).
+  - id: fe.pages
+    component: frontend
+    interaction_type: static_asset
+    method: GET
+    path: "/{login,signup,join,request-password-reset,reset-password,update-password,analytics,logs,logs/:id,traces/:id,users,users/:id,prompts,datasets,datasets/new,datasets/:id,evaluations,evaluations/new,evaluations/:id,evaluations/checklists,radars,settings,team,billing,billing/thank-you,maintenance}"
+    ui_trigger: "top-level navigation + deep links"
+    parameters: [{name: "(varies per page)", location: query, type: mixed, required: false, source: "next router"}]
+    auth_requirement: "none (page shell); data calls require session:jwt held in browser (localStorage)"
+    authz_check_location: none
+    state_preconditions: ["SPA reads JWT from browser storage and attaches it to API calls"]
+    reachability: {status: black_box_reachable, notes: "SSR/SPA served publicly; gating is client-side only"}
+    visibility: black_box_observable
+    controls_observed: {csrf: "n/a (token in header, not cookie)", rate_limited: false, security_headers: "Next defaults"}
+    evidence:
+      black_box: "GET :8080/ -> 200, renders Dashboard shell with nav to analytics/logs/users/prompts/radars/evaluations/settings/billing/team"
+      source_ref: "packages/frontend/pages/*"
+    notes: "Auth is enforced by the API, not the page shell; page HTML/bundle is world-readable."
+
+# ============================================================ NOT MOUNTED =====
+# Present in source but NOT reachable in this deployment — recorded to bound the surface.
+not_mounted:
+  - id: api.analytics.*
+    path: /v1/analytics/{tokens,cost,users/cost,errors,latency,feedback/positive,feedback/negative}
+    reason: "analytics router is never imported/mounted in api/v1/index.ts; most handlers are empty stubs."
+    source_ref: "packages/backend/src/api/v1/analytics.ts (no v1.use(analytics.routes()))"
+    reachability: {status: unreachable_in_source, notes: "black-box: unauth GET :3333/v1/analytics/cost -> 401 (authMiddleware runs before routing; no matching route). With a valid JWT it would 404. Confirms the router is not mounted."}

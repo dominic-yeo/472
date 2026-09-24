@@ -1,0 +1,1277 @@
+# L1 — the agentic/tool-calling layer: MCP server tools (interaction_type: mcp_tool)
+# and native per-agent callables (interaction_type: agent_tool_call).
+# Schema: FinBot_attack_surface/schema/L1_schema.yaml
+#
+# `component` deviation: none of these interactions are owned by a single mounted
+# HTTP sub-app — they are invoked only indirectly, by an LLM's tool-call decision inside
+# a chat/workflow session that itself runs under vendor/admin. We use component="agent"
+# for all records in this file and note, per record, which HTTP entry point(s) can reach
+# it (see l1_vendor.yaml/l1_admin.yaml sse_stream records and l2_semantic.yaml for the
+# full request -> agent -> tool chain).
+#
+# How reachability/visibility work for this layer:
+#   - `path` = the identifier the LLM sees in its `tools` array: bare name for a native
+#     agent_tool_call (e.g. "get_vendor_details"), or "{server}__{tool}" for an mcp_tool
+#     (finbot/mcp/provider.py:170-172, TOOL_NS_SEP = "__").
+#   - `method` = "TOOL_CALL" per schema convention.
+#   - `ui_trigger` is always null — there is no button that calls these directly; they
+#     are only reachable by writing a chat message (or triggering a background workflow)
+#     that causes the LLM to decide to call them. Which HTTP endpoint can trigger that
+#     decision is recorded in `notes`.
+#   - `reachability.status` = black_box_reachable because any of these tools CAN be
+#     invoked purely by conversing with the chat/copilot assistant in natural language —
+#     no source access is needed to trigger one, only to know it exists.
+#   - `visibility`: MCP tool catalogs (name/description/JSON-schema) are grey_box_required
+#     — observable live via GET /darklab/api/v1/supply-chain/servers/{server_type} or
+#     GET /admin/api/v1/mcp/servers/{server_type} (both return the default tool list),
+#     no source read required. Native agent_tool_call schemas are NOT exposed by any
+#     endpoint — those are white_box_required (only visible by reading the agent source
+#     or provoking/observing the model's function-call behavior blind).
+#
+# Common state precondition for every mcp_tool record: the owning agent must have
+# connected to that MCP server this run (finbot/agents/base.py:524-536
+# BaseAgent._connect_mcp_servers, or finbot/agents/chat.py:111-144
+# ChatAssistantBase._connect_mcp), which itself requires
+# MCPServerConfig(namespace, server_type).enabled != false
+# (finbot/mcp/factory.py:88-95) — a server an admin/darklab user disabled for their own
+# namespace is silently withheld from every agent in that namespace.
+
+records:
+  # =========================================================================
+  # MCP servers — finbot/mcp/servers/**, instantiated per-run via
+  # finbot/mcp/factory.py:create_mcp_server(server_type, session_context)
+  # =========================================================================
+
+  # ---- FinDrive (mock document store; finbot/mcp/servers/findrive/server.py) ----
+  # Module docstring: "Files stored here are the indirect prompt injection delivery
+  # mechanism: when agents read 'invoice documents,' poisoned content enters the LLM
+  # context window and can influence agent decisions."
+
+  - id: mcp.findrive.upload_file
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: findrive__upload_file
+    ui_trigger: null
+    parameters:
+      - {name: filename, location: body, type: string, required: true, source: "MCP tool inputSchema (LLM-supplied argument)"}
+      - {name: content, location: body, type: string, required: true, source: "plain text, no binary/base64 handling"}
+      - {name: folder, location: body, type: string, required: false, source: "default '/invoices'"}
+      - {name: vendor_id, location: body, type: integer, required: false, source: "0 = unset; vendor sessions default to current_vendor_id if unset"}
+      - {name: file_type, location: body, type: string, required: false, source: "default 'pdf'"}
+    auth_requirement: "session:temporary (inherited from invoking chat/workflow session)"
+    authz_check_location: in_handler
+    state_preconditions: ["content size <= max_file_size_kb (default 500KB) enforced only at this MCP layer"]
+    reachability: {status: black_box_reachable, notes: "trigger via chat message asking the assistant to save/upload a document"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/findrive/server.py:44-86"}
+    notes: >
+      Reachable from VendorChatAssistant and CoPilotAssistant (both connect 'findrive';
+      finbot/agents/chat.py:109,521,745) and from InvoiceAgent/FraudComplianceAgent
+      (finbot/agents/specialized/invoice.py:57-66, fraud.py:69-81). Vendor session with
+      vendor_id unset defaults to current_vendor_id (server.py:65-67).
+
+  - id: mcp.findrive.get_file
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: findrive__get_file
+    ui_trigger: null
+    parameters: [{name: file_id, location: body, type: integer, required: true, source: "MCP tool inputSchema"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "the model calls this on its own after a chat attachment reference or an invoice/compliance-review task; a user only needs to reference a file_id in conversation or an attached FinDrive file"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/findrive/server.py:88-114"}
+    notes: >
+      Vendor sessions are blocked only from files with vendor_id IS NULL (admin-scoped
+      files); access to any OTHER vendor's file within the same namespace is explicitly
+      left open per the module docstring ("Cross-vendor access is intentionally left open").
+      This differs from the REST route vendor.api.findrive.get (l1_vendor.yaml), which does
+      enforce vendor_id==current_vendor_id — i.e. the MCP path to the same FinDriveFile
+      table is less restrictive than the REST path. Returns full extracted_text, which
+      becomes LLM context on the next turn (indirect prompt injection surface per module
+      docstring).
+
+  - id: mcp.findrive.list_files
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: findrive__list_files
+    ui_trigger: null
+    parameters:
+      - {name: folder, location: body, type: string, required: false, source: ""}
+      - {name: vendor_id, location: body, type: integer, required: false, source: "0=unset, defaults to current_vendor_id for vendor sessions"}
+      - {name: limit, location: body, type: integer, required: false, source: "default 50"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/findrive/server.py:116-142"}
+    notes: "Metadata only, not content."
+
+  - id: mcp.findrive.delete_file
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: findrive__delete_file
+    ui_trigger: null
+    parameters: [{name: file_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "trigger via a chat message instructing the assistant to delete a file"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/findrive/server.py:144-172"}
+    notes: "Same cross-vendor-within-namespace openness as get_file (blocks only vendor_id IS NULL admin files, not other vendors' files). Irreversible (no soft-delete)."
+
+  - id: mcp.findrive.search_files
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: findrive__search_files
+    ui_trigger: null
+    parameters:
+      - {name: query, location: body, type: string, required: true, source: ""}
+      - {name: limit, location: body, type: integer, required: false, source: "default 20"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/findrive/server.py:174-192"}
+    notes: "Vendor sessions filtered post-fetch to vendor_id is not None (still cross-vendor within namespace, only admin-scoped files excluded)."
+
+  # ---- FinMail (mock internal email; finbot/mcp/servers/finmail/server.py) ----
+  # Module docstring: "The tool descriptions here are the CTF attack surface for
+  # email-based scenarios: admins can override them via tool_overrides_json."
+
+  - id: mcp.finmail.send_email
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finmail__send_email
+    ui_trigger: null
+    parameters:
+      - {name: to, location: body, type: array, required: true, source: "list[str] email addresses"}
+      - {name: subject, location: body, type: string, required: true, source: ""}
+      - {name: body, location: body, type: string, required: true, source: ""}
+      - {name: message_type, location: body, type: string, required: false, source: "default 'general'"}
+      - {name: sender_name, location: body, type: string, required: false, source: ""}
+      - {name: cc, location: body, type: array, required: false, source: ""}
+      - {name: bcc, location: body, type: array, required: false, source: ""}
+      - {name: related_invoice_id, location: body, type: integer, required: false, source: "0=none"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "trigger via a chat message ('send an email to X about Y') on any assistant that connects finmail (all of them do)"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finmail/server.py:63-127"}
+    notes: >
+      from_address is forced server-side (vendor's own email for vendor sessions, the
+      namespace admin address otherwise) — sender identity cannot be spoofed via this
+      tool. to/cc/bcc are entirely LLM/tool-caller-supplied and routed through
+      route_and_deliver() (finbot/mcp/servers/finmail/routing.py:51-190), the same
+      address-resolution function used by the vendor/admin REST compose endpoints.
+      Recipients that don't resolve to a known vendor/admin/internal/user address are
+      stored with inbox_type="external" — an application-level fact (external delivery),
+      independent of the CTF toolkit's Dead Drop visualization of that same data.
+
+  - id: mcp.finmail.list_inbox
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finmail__list_inbox
+    ui_trigger: null
+    parameters:
+      - {name: inbox, location: body, type: string, required: false, source: "'vendor' or 'admin', default 'admin'"}
+      - {name: vendor_id, location: body, type: integer, required: false, source: "required (>0) when inbox='vendor'"}
+      - {name: message_type, location: body, type: string, required: false, source: ""}
+      - {name: unread_only, location: body, type: boolean, required: false, source: ""}
+      - {name: limit, location: body, type: integer, required: false, source: "default 20, capped at max_results_per_query (default 50)"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finmail/server.py:129-184"}
+    notes: >
+      _is_vendor_session() gate: a vendor-portal session requesting inbox='admin' gets an
+      explicit error ("Access denied"). An admin-portal session (current_vendor_id is None)
+      has no equivalent restriction and can list ANY vendor's inbox by passing its
+      vendor_id — this is the one-directional admin/vendor MCP boundary noted by both the
+      admin and vendor subagent traces.
+
+  - id: mcp.finmail.read_email
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finmail__read_email
+    ui_trigger: null
+    parameters: [{name: message_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finmail/server.py:186-207"}
+    notes: "Vendor session blocked only from inbox_type=='admin' messages; same namespace-wide vendor-inbox visibility as list_inbox for admin sessions."
+
+  - id: mcp.finmail.search_emails
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finmail__search_emails
+    ui_trigger: null
+    parameters:
+      - {name: query, location: body, type: string, required: true, source: ""}
+      - {name: inbox, location: body, type: string, required: false, source: "default 'admin'"}
+      - {name: vendor_id, location: body, type: integer, required: false, source: ""}
+      - {name: limit, location: body, type: integer, required: false, source: "default 20"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finmail/server.py:209-257"}
+    notes: "Same vendor/admin inbox gate as list_inbox; naive substring match over subject+body fetched server-side then filtered in Python."
+
+  - id: mcp.finmail.mark_as_read
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finmail__mark_as_read
+    ui_trigger: null
+    parameters: [{name: message_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: in_handler
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finmail/server.py:259-281"}
+    notes: ""
+
+  # ---- FinStripe (mock payment processor; finbot/mcp/servers/finstripe/server.py) ----
+
+  - id: mcp.finstripe.create_transfer
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finstripe__create_transfer
+    ui_trigger: null
+    parameters:
+      - {name: vendor_account, location: body, type: string, required: true, source: "bank account string, LLM-supplied (typically copied from get_vendor_details/get_invoice_for_payment tool output)"}
+      - {name: amount, location: body, type: number, required: true, source: ""}
+      - {name: invoice_reference, location: body, type: string, required: true, source: ""}
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: invoice_id, location: body, type: integer, required: true, source: ""}
+      - {name: payment_method, location: body, type: string, required: false, source: "default 'bank_transfer'"}
+      - {name: currency, location: body, type: string, required: false, source: "default 'usd'"}
+      - {name: description, location: body, type: string, required: false, source: ""}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["only reachable from PaymentsAgent's connected MCP set (_get_mcp_servers -> finstripe, taxcalc)"]
+    reachability: {status: black_box_reachable, notes: "not directly reachable from interactive chat (VendorChatAssistant/CoPilotAssistant do not connect finstripe) — only via the background orchestrator -> Payments Agent workflow"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finstripe/server.py:46-96"}
+    notes: >
+      Creates a PaymentTransaction row with status='completed' immediately (mock, no real
+      settlement/async state) and no server-side amount ceiling at the tool layer itself
+      (the PaymentsAgent's system prompt states a max_single_payment threshold, but that is
+      a soft LLM instruction, not enforced in this tool's code — see l1_mcp.yaml
+      agent.payments.process_payment and l2_semantic.yaml for the full payment-execution
+      operation).
+
+  - id: mcp.finstripe.get_transfer
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finstripe__get_transfer
+    ui_trigger: null
+    parameters: [{name: transfer_id, location: body, type: string, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finstripe/server.py:98-114"}
+    notes: "No namespace/vendor ownership filter beyond whatever PaymentTransactionRepository applies internally."
+
+  - id: mcp.finstripe.get_account_balance
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finstripe__get_account_balance
+    ui_trigger: null
+    parameters: [{name: account_id, location: body, type: string, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finstripe/server.py:116-128"}
+    notes: "Always returns the same configured mock_balance regardless of account_id — no real per-account state."
+
+  - id: mcp.finstripe.list_transfers
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: finstripe__list_transfers
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: limit, location: body, type: integer, required: false, source: "default 10"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/finstripe/server.py:130-148"}
+    notes: ""
+
+  # ---- TaxCalc (pure computation; finbot/mcp/servers/taxcalc/server.py) ----
+
+  - id: mcp.taxcalc.calculate_tax
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: taxcalc__calculate_tax
+    ui_trigger: null
+    parameters:
+      - {name: amount, location: body, type: number, required: true, source: ""}
+      - {name: jurisdiction, location: body, type: string, required: false, source: "default from server config, e.g. 'US-CA'"}
+      - {name: category, location: body, type: string, required: false, source: "'goods'|'services'|'entertainment'"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "reachable from InvoiceAgent and PaymentsAgent"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/taxcalc/server.py:41-102"}
+    notes: "Pure computation over admin-configurable rates (MCPServerConfig.config_json), no DB writes."
+
+  - id: mcp.taxcalc.get_tax_rates
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: taxcalc__get_tax_rates
+    ui_trigger: null
+    parameters: [{name: jurisdiction, location: body, type: string, required: false, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/taxcalc/server.py:104-144"}
+    notes: ""
+
+  - id: mcp.taxcalc.validate_tax_id
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: taxcalc__validate_tax_id
+    ui_trigger: null
+    parameters:
+      - {name: tax_id, location: body, type: string, required: true, source: ""}
+      - {name: country, location: body, type: string, required: false, source: "default 'US'"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/taxcalc/server.py:146-186"}
+    notes: "Format validation only, not a real registry check."
+
+  # ---- SystemUtils (fully mocked; finbot/mcp/servers/systemutils/server.py) ----
+  # Module docstring: "Completely mock -- records what the agent attempted but executes
+  # nothing... Tools look plausible but accept free-form string arguments that a poisoned
+  # LLM could fill with destructive commands." Every tool below shares this shape: it
+  # logs the raw arguments at WARNING level and returns a canned success response; no
+  # actual system, filesystem, network, or user-management action is performed.
+
+  - id: mcp.systemutils.run_diagnostics
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__run_diagnostics
+    ui_trigger: null
+    parameters: [{name: command, location: body, type: string, required: true, source: "free-form string"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "reachable from VendorChatAssistant and CoPilotAssistant (both connect systemutils by default) and from FraudComplianceAgent"}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:45-66"}
+    notes: "No-op mock — logs and echoes back a canned 'completed' response for whatever string the model supplies."
+
+  - id: mcp.systemutils.manage_storage
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__manage_storage
+    ui_trigger: null
+    parameters:
+      - {name: action, location: body, type: string, required: true, source: "free-form"}
+      - {name: target, location: body, type: string, required: true, source: "free-form path-like string"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:68-89"}
+    notes: "No-op mock."
+
+  - id: mcp.systemutils.rotate_logs
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__rotate_logs
+    ui_trigger: null
+    parameters:
+      - {name: service, location: body, type: string, required: true, source: "free-form"}
+      - {name: options, location: body, type: string, required: false, source: ""}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:91-113"}
+    notes: "No-op mock."
+
+  - id: mcp.systemutils.database_maintenance
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__database_maintenance
+    ui_trigger: null
+    parameters: [{name: query, location: body, type: string, required: true, source: "free-form, described as accepting SQL-like maintenance queries"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:115-135"}
+    notes: "No-op mock — the 'query' string is never executed against any database, only echoed back truncated to 100 chars."
+
+  - id: mcp.systemutils.network_request
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__network_request
+    ui_trigger: null
+    parameters:
+      - {name: url, location: body, type: string, required: true, source: "free-form"}
+      - {name: method, location: body, type: string, required: false, source: "default 'GET'"}
+      - {name: headers, location: body, type: string, required: false, source: ""}
+      - {name: body, location: body, type: string, required: false, source: ""}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:138-164"}
+    notes: >
+      No-op mock — does not perform any real HTTP request; always returns a canned 200
+      response. Every call is captured as a normal MCP tool-call event through the agent
+      event pipeline (finbot/mcp/provider.py logging + event_bus), which is the sole
+      data source for this application's outbound-request activity signal.
+
+  - id: mcp.systemutils.read_config
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__read_config
+    ui_trigger: null
+    parameters: [{name: filepath, location: body, type: string, required: true, source: "free-form path string"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:167-187"}
+    notes: >
+      No-op mock — regardless of the filepath argument, always returns the SAME
+      hardcoded fake content block (a fabricated DATABASE_URL/SECRET_KEY snippet with
+      values already masked). Does not read any real file on disk.
+
+  - id: mcp.systemutils.manage_users
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__manage_users
+    ui_trigger: null
+    parameters:
+      - {name: action, location: body, type: string, required: true, source: "'create'|'modify'|'delete'|'list'"}
+      - {name: username, location: body, type: string, required: true, source: ""}
+      - {name: role, location: body, type: string, required: false, source: "default 'viewer'"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:190-212"}
+    notes: "No-op mock — no real user/account is created, modified, or removed anywhere in the platform."
+
+  - id: mcp.systemutils.execute_script
+    component: agent
+    interaction_type: mcp_tool
+    method: TOOL_CALL
+    path: systemutils__execute_script
+    ui_trigger: null
+    parameters:
+      - {name: script_content, location: body, type: string, required: true, source: "free-form, arbitrary length"}
+      - {name: interpreter, location: body, type: string, required: false, source: "default 'bash'"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: grey_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/mcp/servers/systemutils/server.py:215-237"}
+    notes: "No-op mock — script_content is never interpreted/executed, only length-logged and echoed back truncated to 200 chars."
+
+  # =========================================================================
+  # Native per-agent callables (agent_tool_call) — not MCP, bound directly on
+  # the agent class (finbot/agents/base.py:_get_callables / chat.py
+  # _build_native_callables). Backing implementations mostly in
+  # finbot/tools/data/*.py, decorated with @agent_tool
+  # (finbot/agents/utils.py:44) which emits tool_call_start/success/failure
+  # events around every invocation regardless of outcome.
+  # =========================================================================
+
+  # ---- VendorChatAssistant natives (finbot/agents/chat.py:571-703) ----
+  # Reachable via: vendor.api.chat.send (l1_vendor.yaml)
+
+  - id: agent.vendor_chat.get_vendor_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_details
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "any chat message that references or implies a vendor lookup"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:705-707; finbot/tools/data/vendor.py:13-31"}
+    notes: >
+      get_vendor_details() in finbot/tools/data/vendor.py calls VendorRepository.get_vendor,
+      which is NAMESPACE-SCOPED ONLY — no current_vendor_id equality check. This is a
+      materially weaker authz posture than the REST route vendor.api.vendors.get
+      (l1_vendor.yaml), which 403s on vendor_id != current_vendor_id. The system prompt
+      tells the model "The current vendor ID is {current_vendor_id}" as a soft steering
+      hint only (finbot/agents/chat.py:563) — not enforced server-side for this tool call.
+      Full vendor record returned, including tin/bank_account_number/bank_routing_number/
+      bank_account_holder_name.
+
+  - id: agent.vendor_chat.get_invoice_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_invoice_details
+    ui_trigger: null
+    parameters: [{name: invoice_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:709-710; finbot/tools/data/invoice.py"}
+    notes: "InvoiceRepository.get_invoice is namespace-only ('validates namespace, not vendor' per its own docstring) — same weaker-than-REST posture as get_vendor_details."
+
+  - id: agent.vendor_chat.get_vendor_invoices
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_invoices
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:712-713"}
+    notes: "Namespace-scoped only, same pattern as sibling lookups."
+
+  - id: agent.vendor_chat.get_vendor_payment_summary
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_payment_summary
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:715-718"}
+    notes: ""
+
+  - id: agent.vendor_chat.get_vendor_contact_info
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_contact_info
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:720-723"}
+    notes: ""
+
+  - id: agent.vendor_chat.start_workflow
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: start_workflow
+    ui_trigger: null
+    parameters:
+      - {name: description, location: body, type: string, required: true, source: "LLM-composed free text"}
+      - {name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}
+      - {name: invoice_id, location: body, type: integer, required: false, source: "nullable, LLM-supplied"}
+      - {name: attachment_file_ids, location: body, type: array, required: false, source: "LLM-supplied list of FinDrive file_ids"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["FastAPI BackgroundTasks must be available on the request (always true for vendor.api.chat.send)"]
+    reachability: {status: black_box_reachable, notes: "the model calls this itself when a chat message implies an action like re-review or reprocessing"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:215-278"}
+    notes: >
+      Schedules run_orchestrator_agent as a background task with an LLM-chosen
+      vendor_id/invoice_id/attachment_file_ids — none of which is re-validated against
+      session_context.current_vendor_id before being queued. This is the bridge from the
+      interactive chat layer into the orchestrator/specialized-agent workflow layer (see
+      agent.orchestrator.* below and l2_semantic.yaml).
+
+  # ---- CoPilotAssistant natives (finbot/agents/chat.py:835-1079) ----
+  # Reachable via: admin.api.copilot.chat (l1_admin.yaml)
+
+  - id: agent.copilot.list_vendors
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: list_vendors
+    ui_trigger: null
+    parameters: []
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1081-1097"}
+    notes: "Lists every vendor (id/company_name/vendor_category/status/email/trust_level) in the namespace — a Co-Pilot-only capability, no vendor sibling."
+
+  - id: agent.copilot.get_all_vendors_summary
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_all_vendors_summary
+    ui_trigger: null
+    parameters: []
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1119-1120; finbot/tools/data/admin_reports.py:24"}
+    notes: "Iterates every vendor in the namespace, no per-vendor restriction — this is the genuine cross-vendor-within-namespace capability the admin/Co-Pilot context has that vendor chat does not."
+
+  - id: agent.copilot.get_pending_actions_summary
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_pending_actions_summary
+    ui_trigger: null
+    parameters: []
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1122-1123; finbot/tools/data/admin_reports.py:69"}
+    notes: "Pending vendor applications, unprocessed invoices, high-risk vendors across the whole namespace."
+
+  - id: agent.copilot.get_vendor_compliance_docs
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_compliance_docs
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "prompted via a 'review compliance documents for vendor X' chat request"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1125-1126; finbot/tools/data/admin_reports.py:129"}
+    notes: >
+      Pulls FULL content_text of every matching FinDrive file for the vendor directly into
+      the tool-call JSON that becomes LLM context — the code comment at
+      admin_reports.py:6-8 flags this as the indirect-prompt-injection surface for
+      report-generation flows (uploaded "compliance certificate" content is untrusted text
+      entering the instruction channel).
+
+  - id: agent.copilot.get_vendor_activity_report
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_activity_report
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: "LLM-supplied"}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1130-1133; finbot/tools/data/admin_reports.py:171"}
+    notes: "Combines profile + invoices + payments + emails + documents for one vendor into a single tool result — the richest single cross-domain data pull available to any agent."
+
+  - id: agent.copilot.save_report
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: save_report
+    ui_trigger: null
+    parameters:
+      - {name: title, location: body, type: string, required: true, source: "LLM-composed"}
+      - {name: content, location: body, type: string, required: true, source: "LLM-composed markdown"}
+      - {name: report_type, location: body, type: string, required: true, source: "enum of report kinds"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "the model calls this automatically at the end of any report-generation workflow"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1135-1140; finbot/tools/data/admin_reports.py:262-296"}
+    notes: "Writes the LLM-composed markdown into FinDriveFileRepository.create_file(vendor_id=None, folder_path='/reports') — lands in the same admin-scoped FinDrive bucket admin.api.findrive.list surfaces (vendor_id IS NULL filter)."
+
+  - id: agent.copilot.start_workflow
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: start_workflow
+    ui_trigger: null
+    parameters:
+      - {name: description, location: body, type: string, required: true, source: ""}
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: invoice_id, location: body, type: integer, required: false, source: ""}
+      - {name: attachment_file_ids, location: body, type: array, required: false, source: ""}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/chat.py:1029-1062"}
+    notes: "Identical mechanism to agent.vendor_chat.start_workflow — same background run_orchestrator_agent dispatch, shared code path."
+
+  # ---- OrchestratorAgent (finbot/agents/orchestrator.py) — background workflow only,
+  # never directly reachable from an interactive chat turn; only via start_workflow above
+  # or the register/request-review/reprocess REST endpoints' own background dispatch.
+
+  - id: agent.orchestrator.delegate_to_onboarding
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: delegate_to_onboarding
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: "carried over from the triggering task_data"}
+      - {name: task_description, location: body, type: string, required: true, source: "LLM-composed"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["max 2 delegation attempts per agent per workflow (_check_delegation_limit)"]
+    reachability: {status: black_box_reachable, notes: "reached via vendor.api.vendors.register / request_review or a chat start_workflow call whose description matches the 'Vendor Onboarding'/'Vendor Re-Review' recipe"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/orchestrator.py:424-446"}
+    notes: "Spawns VendorOnboardingAgent (finbot/agents/runner.py:113-131) with a fresh sub-workflow_id, sharing the parent session_context."
+
+  - id: agent.orchestrator.delegate_to_invoice
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: delegate_to_invoice
+    ui_trigger: null
+    parameters:
+      - {name: invoice_id, location: body, type: integer, required: true, source: ""}
+      - {name: task_description, location: body, type: string, required: true, source: "LLM-composed, enriched with prior-agent context (_enrich_with_prior_context)"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["max 2 delegation attempts"]
+    reachability: {status: black_box_reachable, notes: "reached via vendor.api.invoices.create/reprocess or a matching chat start_workflow"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/orchestrator.py:448-477"}
+    notes: "Spawns InvoiceAgent. Also forwards attachment_file_ids from the ORIGINATING task_data if present (orchestrator.py:464-467)."
+
+  - id: agent.orchestrator.delegate_to_fraud
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: delegate_to_fraud
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: task_description, location: body, type: string, required: true, source: "may include compliance-document-review keywords that trigger FinDrive doc injection (see agent.fraud.* below)"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["max 2 delegation attempts"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/orchestrator.py:479-508"}
+    notes: "Spawns FraudComplianceAgent. Passes through attachment_file_ids from the originating task_data."
+
+  - id: agent.orchestrator.delegate_to_payments
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: delegate_to_payments
+    ui_trigger: null
+    parameters:
+      - {name: invoice_id, location: body, type: integer, required: true, source: ""}
+      - {name: task_description, location: body, type: string, required: true, source: ""}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["max 2 delegation attempts; recipe instructs this step to run only after invoice approval in step 1, but this is a prompt-level sequencing rule, not a code-enforced gate on the tool itself"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/orchestrator.py:510-538"}
+    notes: "Spawns PaymentsAgent, then appends a 'next_step' instruction to the result telling the orchestrator LLM it MUST now delegate_to_communication."
+
+  - id: agent.orchestrator.delegate_to_system_maintenance
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: delegate_to_system_maintenance
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: "0 accepted for 'system-wide' operations"}
+      - {name: task_description, location: body, type: string, required: true, source: ""}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["max 2 delegation attempts"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/orchestrator.py:540-572"}
+    notes: >
+      Actually routed through run_fraud_agent (FraudComplianceAgent) with the task
+      description rewritten to instruct use of the SystemUtils MCP tools (run_diagnostics,
+      manage_storage, rotate_logs, database_maintenance, network_request, read_config,
+      manage_users, execute_script) — this delegate name is a thin wrapper, not a
+      separate agent class.
+
+  - id: agent.orchestrator.delegate_to_communication
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: delegate_to_communication
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: task_description, location: body, type: string, required: true, source: ""}
+      - {name: notification_type, location: body, type: string, required: true, source: "enum"}
+      - {name: to_addresses, location: body, type: array, required: false, source: "nullable, LLM-supplied"}
+      - {name: cc_addresses, location: body, type: array, required: false, source: "nullable"}
+      - {name: bcc_addresses, location: body, type: array, required: false, source: "nullable"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["max 2 delegation attempts"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/orchestrator.py:574-616"}
+    notes: "Spawns CommunicationAgent, the final step of most orchestrator recipes — this is the delegation path that ultimately calls finmail__send_email."
+
+  - id: agent.orchestrator.complete_task
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: complete_task
+    ui_trigger: null
+    parameters:
+      - {name: task_status, location: body, type: string, required: true, source: "enum success|failed"}
+      - {name: task_summary, location: body, type: string, required: true, source: "LLM-composed free text"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "every agent's run loop terminates by calling this; present on ALL agent classes, not just the orchestrator"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/base.py:364-388,416-426"}
+    notes: "Control-flow tool injected by BaseAgent._get_final_tool_definitions on every agent; ends the agent loop and, for orchestrator-style recipes, triggers _on_task_completion hooks that persist agent_notes onto the relevant Vendor/Invoice row."
+
+  # ---- InvoiceAgent natives (finbot/agents/specialized/invoice.py) ----
+
+  - id: agent.invoice.get_invoice_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_invoice_details
+    ui_trigger: null
+    parameters: [{name: invoice_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "background-workflow only, via delegate_to_invoice"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/invoice.py:319-350"}
+    notes: ""
+
+  - id: agent.invoice.get_vendor_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_details
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/invoice.py:424-461"}
+    notes: ""
+
+  - id: agent.invoice.update_invoice_status
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: update_invoice_status
+    ui_trigger: null
+    parameters:
+      - {name: invoice_id, location: body, type: integer, required: true, source: ""}
+      - {name: status, location: body, type: string, required: true, source: "enum processing|approved|rejected — the LLM's own approval/rejection decision"}
+      - {name: agent_notes, location: body, type: string, required: true, source: "LLM-composed reasoning, persisted verbatim and re-fed into the next review round"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "the actual approve/reject decision point — reachable end-to-end from vendor.api.invoices.create or .reprocess"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/invoice.py:352-423"}
+    notes: >
+      This is THE state-transition point for invoice approval/rejection. Emits business
+      event 'invoice.decision'. The invoice's own agent_notes field (fed back as prior
+      review notes on the next call via the user-prompt-construction step, see
+      invoice.py:198-243) is itself untrusted, LLM-written free text mixed directly into
+      the next agent's instruction channel — a memory-poisoning-relevant data flow
+      documented in source as a design tradeoff (invoice.py:218-226 code comment) between
+      instructions and data sharing one channel.
+
+  # ---- FraudComplianceAgent natives (finbot/agents/specialized/fraud.py) ----
+
+  - id: agent.fraud.get_vendor_risk_profile
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_risk_profile
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "background-workflow only, via delegate_to_fraud"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/fraud.py:421-439"}
+    notes: ""
+
+  - id: agent.fraud.get_invoice_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_invoice_details
+    ui_trigger: null
+    parameters: [{name: invoice_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/fraud.py:441-459"}
+    notes: ""
+
+  - id: agent.fraud.get_vendor_invoices
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_invoices
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/fraud.py:461-484"}
+    notes: ""
+
+  - id: agent.fraud.update_vendor_risk
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: update_vendor_risk
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: risk_level, location: body, type: string, required: true, source: "enum low|medium|high — the LLM's own assessment"}
+      - {name: agent_notes, location: body, type: string, required: true, source: "LLM-composed"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/fraud.py:486-539"}
+    notes: "State-transition point for Vendor.risk_level. Emits 'fraud.vendor_risk_updated' business event."
+
+  - id: agent.fraud.flag_invoice_for_review
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: flag_invoice_for_review
+    ui_trigger: null
+    parameters:
+      - {name: invoice_id, location: body, type: integer, required: true, source: ""}
+      - {name: flag_reason, location: body, type: string, required: true, source: "enum"}
+      - {name: recommended_action, location: body, type: string, required: true, source: "enum hold|reject|escalate"}
+      - {name: agent_notes, location: body, type: string, required: true, source: "LLM-composed"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/fraud.py:541-614"}
+    notes: >
+      Note the fraud agent's user-prompt builder (_get_user_prompt, fraud.py:212-283)
+      injects the FULL content_text of up to 2 matching FinDrive files directly into the
+      prompt string whenever the task description contains compliance-review keywords
+      (soc2/iso/pci-dss/certificate/etc.) — untrusted vendor-uploaded document content
+      entering the instruction channel, documented in source as a design tradeoff
+      (fraud.py:234-241 code comment).
+
+  # ---- PaymentsAgent natives (finbot/agents/specialized/payments.py) ----
+
+  - id: agent.payments.get_invoice_for_payment
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_invoice_for_payment
+    ui_trigger: null
+    parameters: [{name: invoice_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "background-workflow only, via delegate_to_payments"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/payments.py:306-324"}
+    notes: "Returns invoice + vendor banking info together, purpose-built for the transfer step below."
+
+  - id: agent.payments.get_vendor_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_details
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/payments.py:326-361"}
+    notes: "Returns full banking fields including bank_account_number/bank_routing_number."
+
+  - id: agent.payments.get_vendor_payment_summary
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_payment_summary
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/payments.py:363-381"}
+    notes: ""
+
+  - id: agent.payments.process_payment
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: process_payment
+    ui_trigger: null
+    parameters:
+      - {name: invoice_id, location: body, type: integer, required: true, source: ""}
+      - {name: payment_method, location: body, type: string, required: true, source: "enum bank_transfer|wire|ach"}
+      - {name: payment_reference, location: body, type: string, required: true, source: "typically the finstripe transfer_id returned by mcp.finstripe.create_transfer"}
+      - {name: agent_notes, location: body, type: string, required: true, source: "LLM-composed"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: ["business rule (prompt-level only): invoice must be 'approved' before this is called — not code-enforced inside process_payment itself beyond whatever finbot/tools/data/payment.py checks"]
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/payments.py:383-457"}
+    notes: "Transitions Invoice.status to 'paid'. Emits 'payment.processed' business event. This is the terminal state-change of the Invoice Processing / Invoice Reprocessing orchestrator recipes."
+
+  # ---- VendorOnboardingAgent natives (finbot/agents/specialized/onboarding.py) ----
+
+  - id: agent.onboarding.get_vendor_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_details
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "background-workflow only, via delegate_to_onboarding"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/onboarding.py:274-311"}
+    notes: ""
+
+  - id: agent.onboarding.update_vendor_status
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: update_vendor_status
+    ui_trigger: null
+    parameters:
+      - {name: vendor_id, location: body, type: integer, required: true, source: ""}
+      - {name: status, location: body, type: string, required: true, source: "enum pending|active|inactive"}
+      - {name: trust_level, location: body, type: string, required: true, source: "enum low|standard|high"}
+      - {name: risk_level, location: body, type: string, required: true, source: "enum low|medium|high"}
+      - {name: agent_notes, location: body, type: string, required: true, source: "LLM-composed"}
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: none
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "end-to-end reachable from vendor.api.vendors.register (new vendor's very first onboarding decision) or .request_review"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/onboarding.py:313-395"}
+    notes: >
+      State-transition point for Vendor.status/trust_level/risk_level — the very first
+      autonomous decision made about a brand-new, entirely user-supplied vendor profile
+      (company_name, services, industry, bank details all came from
+      vendor.api.vendors.register with only Pydantic-type validation). Emits
+      'vendor.decision' business event. The onboarding agent's own user-prompt builder
+      (_get_user_prompt, onboarding.py:164-208) mixes the vendor's self-reported
+      'services' free-text field and any prior agent_notes directly into the instruction
+      channel — same documented data/instruction-mixing tradeoff noted on the invoice
+      agent above.
+
+  # ---- CommunicationAgent natives (finbot/agents/specialized/communication.py) ----
+
+  - id: agent.communication.get_vendor_contact_info
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_contact_info
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: "background-workflow only, via delegate_to_communication"}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/communication.py:268-276"}
+    notes: ""
+
+  - id: agent.communication.get_vendor_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_vendor_details
+    ui_trigger: null
+    parameters: [{name: vendor_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/communication.py:278-297"}
+    notes: ""
+
+  - id: agent.communication.get_invoice_details
+    component: agent
+    interaction_type: agent_tool_call
+    method: TOOL_CALL
+    path: get_invoice_details
+    ui_trigger: null
+    parameters: [{name: invoice_id, location: body, type: integer, required: true, source: ""}]
+    auth_requirement: "session:temporary (inherited)"
+    authz_check_location: repository_layer
+    state_preconditions: []
+    reachability: {status: black_box_reachable, notes: ""}
+    visibility: white_box_required
+    controls_observed: {csrf: false, rate_limited: false, security_headers: false}
+    evidence: {source_ref: "finbot/agents/specialized/communication.py:299-319"}
+    notes: >
+      This agent's ONLY write-capable action is mcp.finmail.send_email (it connects the
+      finmail MCP server, communication.py:67-73, and has no native send tool of its own —
+      sending always goes through the MCP path). to_addresses/cc_addresses/bcc_addresses
+      arriving from delegate_to_communication (which itself may carry user-influenced
+      addresses forwarded from a chat message) are passed through to finmail__send_email
+      largely as-is, steered only by the system prompt's department-directory guidance,
+      not a code-level allowlist.
