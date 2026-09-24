@@ -1,0 +1,491 @@
+# Agentic attack-surface schema
+# Companion to L1_schema.yaml and L2_schema.yaml.
+#
+# L1 records concrete interfaces; L2 records business operations. This schema
+# records the agent runtime and its control/data paths, which may be shared by
+# multiple L2 operations and realized through multiple L1 interactions.
+#
+# Model this as linked inventories rather than one oversized record: agents,
+# their capability bindings, context/memory sources, execution transitions,
+# and controls. Use stable IDs to connect these records to one another and to
+# the existing L1/L2 inventories. Keep secrets out of this dataset; record the
+# configuration source/version and whether a value was observed or inferred.
+
+record_sets:
+  agents:
+    record: One logical agent role or deployable agent configuration.
+    fields:
+      id:
+        type: string
+        desc: Stable identifier, e.g. "agent.vendor_chat" or "agent.payments".
+
+      name:
+        type: string
+        desc: Human-readable agent name.
+
+      component:
+        type: string
+        desc: Owning L1 component, e.g. vendor, admin, or agent.
+
+      agent_kind:
+        type: enum [interactive, orchestrator, specialist, reviewer, other]
+        desc: The agent's runtime role in the application.
+
+      purpose:
+        type: string
+        desc: Intended task and decision authority of this agent.
+
+      invocation_surfaces:
+        type: list[{l1_id, trigger, auth_context}]
+        desc: L1 entry points and conditions that can start or resume this agent.
+
+      model_config:
+        type: object {provider, model, deployment, version, config_source, evidence_status}
+        desc: >
+          Provider/model identity and where configuration comes from. Record
+          references or redacted values only; never copy API keys or secrets.
+          evidence_status is observed | source_confirmed | inferred | unknown.
+
+      instruction_sources:
+        type: list[{surface_id, instruction_role, precedence, config_version}]
+        desc: System/developer instructions and other prompt templates assembled for this agent.
+
+      tool_binding_ids:
+        type: list[string]
+        desc: References to the tools/capabilities available to this agent at runtime.
+
+      context_source_ids:
+        type: list[string]
+        desc: References to user, tool, retrieval, history, or delegated-task context sources.
+
+      memory_ids:
+        type: list[string]
+        desc: References to state stores the agent can read or write across turns/runs.
+
+      control_ids:
+        type: list[string]
+        desc: References to controls applied to this agent's model or tool execution.
+
+      authority_context:
+        type: object {principal_source, tenant_scope, resource_scope, delegated_identity, authz_enforcement}
+        desc: >
+          Effective identity and access scope used by the agent's tools. State
+          where authorization is enforced (code, prompt, external policy, or
+          none/unknown), rather than treating prompt instructions as enforcement.
+
+      related_l2_ids:
+        type: list[string]
+        desc: L2 business operations this agent can participate in.
+
+      source_ref:
+        type: string
+        desc: Source/config location supporting this record.
+
+      evidence_status:
+        type: enum [observed, source_confirmed, inferred, unknown]
+        desc: How directly this runtime configuration was verified.
+
+      notes:
+        type: string
+        desc: Free-text caveats or configuration details that do not fit the structured fields.
+
+  tool_bindings:
+    record: One tool or capability exposed to an agent in a particular runtime/configuration.
+    fields:
+      id:
+        type: string
+        desc: Stable identifier for this agent-to-tool binding.
+
+      agent_id:
+        type: string
+        desc: Agent that receives this capability.
+
+      l1_id:
+        type: string | null
+        desc: L1 tool interaction, if catalogued separately.
+
+      tool_name:
+        type: string
+        desc: Name presented to the model or invoked by the agent runtime.
+
+      tool_source:
+        type: enum [native, mcp, api, plugin, code, external, other]
+        desc: How the capability is provided.
+
+      server_or_provider:
+        type: string | null
+        desc: MCP server, API, plugin, or service that supplies the tool.
+
+      schema_ref:
+        type: string | null
+        desc: Reference/version/hash for the argument schema presented at runtime.
+
+      description_source:
+        type: string | null
+        desc: Authored or overridden source of the tool description shown to the model.
+
+      capabilities:
+        type: list[string]
+        desc: Data/actions the tool can access or perform.
+
+      argument_handling:
+        type: object {validation, authorization, normalization, enforced_by}
+        desc: >
+          How arguments are checked and transformed, and whether checks are
+          enforced in code, by an external policy, by prompt guidance, or not at all.
+
+      effect_class:
+        type: enum [read, write, external_send, financial, destructive, mixed, none, unknown]
+        desc: Security-relevant side-effect class of invoking the tool.
+
+      approval_required:
+        type: boolean | unknown
+        desc: Whether invocation requires a human or explicit user approval.
+
+      related_l2_ids:
+        type: list[string]
+        desc: L2 operations that use this binding.
+
+      visibility:
+        type: enum [black_box_observable, grey_box_required, white_box_required]
+        desc: >
+          Minimum access to understand *what this operation does*
+          semantically — distinct from L1 visibility (knowing the endpoint
+          exists) and from reachability (being able to trigger it). E.g. an
+          admin can black-box-observe that a "tool description" field exists
+          and is editable without grey/white-box access revealing that editing
+          it changes what an unrelated agent does three requests later.
+
+      reachability:
+        type: object {status, notes}
+        desc: >
+          Same status vocabulary as L1.reachability, but answering "can this
+          operation actually be triggered end-to-end in this deployment" —
+          e.g. an operation whose detector exists and whose L1 endpoints are
+          live, but whose triggering agent is behind an LLM_PROVIDER that
+          isn't configured, is white-box-confirmed-present but
+          black-box-unreachable until an API key is supplied.
+
+      evidence_status:
+        type: enum [observed, source_confirmed, inferred, unknown]
+        desc: How directly this binding and its effective configuration were verified.
+
+      source_ref:
+        type: string
+        desc: Source/config location supporting this record.
+
+      notes:
+        type: string
+        desc: Free-text caveats.
+
+  context_sources:
+    record: One source of content that may be added to an agent's model context.
+    fields:
+      id:
+        type: string
+        desc: Stable identifier for the context source.
+
+      source_kind:
+        type: enum [system_prompt, developer_prompt, user_input, chat_history, tool_result, document, retrieval, delegated_summary, external, other]
+        desc: Origin category of the content.
+
+      source_ref:
+        type: string
+        desc: Data field, component, or code/config location where content originates.
+
+      destination_agent_ids:
+        type: list[string]
+        desc: Agents whose model context may receive this content.
+
+      destination_channel:
+        type: enum [system, developer, user, tool, other, unknown]
+        desc: Message/context role or channel used when content reaches the model.
+
+      provenance:
+        type: string
+        desc: User, tenant, tool, service, or other origin when known.
+
+      trust_class:
+        type: enum [trusted_instruction, untrusted_data, mixed, unknown]
+        desc: Whether content is treated as instruction, data, or a mixture by the runtime.
+
+      transformation:
+        type: string
+        desc: Serialization, interpolation, summarization, truncation, filtering, or other handling before model use.
+
+      persistence_scope:
+        type: enum [turn, session, workflow, user, tenant, global, external, none, unknown]
+        desc: How long or how broadly this content is retained or reused.
+
+      related_l2_ids:
+        type: list[string]
+        desc: L2 operations in which this source can participate.
+
+      visibility:
+        type: enum [black_box_observable, grey_box_required, white_box_required]
+        desc: >
+          Minimum access to understand *what this operation does*
+          semantically — distinct from L1 visibility (knowing the endpoint
+          exists) and from reachability (being able to trigger it). E.g. an
+          admin can black-box-observe that a "tool description" field exists
+          and is editable without grey/white-box access revealing that editing
+          it changes what an unrelated agent does three requests later.
+
+      reachability:
+        type: object {status, notes}
+        desc: >
+          Same status vocabulary as L1.reachability, but answering "can this
+          operation actually be triggered end-to-end in this deployment" —
+          e.g. an operation whose detector exists and whose L1 endpoints are
+          live, but whose triggering agent is behind an LLM_PROVIDER that
+          isn't configured, is white-box-confirmed-present but
+          black-box-unreachable until an API key is supplied.
+
+      evidence_status:
+        type: enum [observed, source_confirmed, inferred, unknown]
+        desc: How directly the source-to-context path was verified.
+
+      notes:
+        type: string
+        desc: Free-text caveats, including known prompt-injection or cross-tenant concerns.
+
+  memory_stores:
+    record: One store or state mechanism that agents can read from or write to across steps.
+    fields:
+      id:
+        type: string
+        desc: Stable identifier for the memory/state store.
+
+      store_kind:
+        type: enum [conversation_history, agent_notes, task_summary, vector_store, database, cache, event_log, external, other]
+        desc: Kind of persistent or semi-persistent state.
+
+      owner_component:
+        type: string
+        desc: Component/service that owns the store.
+
+      readers:
+        type: list[string]
+        desc: Agent IDs or roles that can read this store.
+
+      writers:
+        type: list[string]
+        desc: Agent IDs or roles that can write this store.
+
+      scope:
+        type: enum [turn, session, workflow, user, tenant, global, external, unknown]
+        desc: Isolation and reuse boundary for stored state.
+
+      write_provenance:
+        type: string
+        desc: Who or what can populate the memory, including whether untrusted users/tools can write it.
+
+      read_path:
+        type: string
+        desc: How stored content is selected and returned to an agent/model.
+
+      retention_and_deletion:
+        type: string
+        desc: TTL, cleanup, user deletion, or other lifecycle behavior.
+
+      related_l2_ids:
+        type: list[string]
+        desc: L2 operations that read or mutate this store.
+
+      evidence_status:
+        type: enum [observed, source_confirmed, inferred, unknown]
+        desc: How directly scope and access behavior were verified.
+
+      visibility:
+        type: enum [black_box_observable, grey_box_required, white_box_required]
+        desc: >
+          Minimum access to understand *what this operation does*
+          semantically — distinct from L1 visibility (knowing the endpoint
+          exists) and from reachability (being able to trigger it). E.g. an
+          admin can black-box-observe that a "tool description" field exists
+          and is editable without grey/white-box access revealing that editing
+          it changes what an unrelated agent does three requests later.
+
+      reachability:
+        type: object {status, notes}
+        desc: >
+          Same status vocabulary as L1.reachability, but answering "can this
+          operation actually be triggered end-to-end in this deployment" —
+          e.g. an operation whose detector exists and whose L1 endpoints are
+          live, but whose triggering agent is behind an LLM_PROVIDER that
+          isn't configured, is white-box-confirmed-present but
+          black-box-unreachable until an API key is supplied.
+
+      source_ref:
+        type: string
+        desc: Source/config location supporting this record.
+
+      notes:
+        type: string
+        desc: Free-text caveats.
+
+  execution_edges:
+    record: One possible transition between agent steps, tools, or external events.
+    fields:
+      id:
+        type: string
+        desc: Stable identifier for this transition.
+
+      source:
+        type: object {agent_id, step}
+        desc: Agent and step that can initiate the transition.
+
+      destination:
+        type: object {agent_id, tool_binding_id, external_surface}
+        desc: Next agent, tool binding, or external surface; populate the applicable target.
+
+      decision_maker:
+        type: enum [deterministic_code, llm, user, scheduler, external_event, human_reviewer, unknown]
+        desc: Who or what selects or triggers this transition.
+
+      condition:
+        type: string
+        desc: Condition or model-directed intent that enables the transition.
+
+      input_source_ids:
+        type: list[string]
+        desc: Context or memory sources that can influence this transition.
+
+      argument_sources:
+        type: string
+        desc: How arguments are constructed, including model composition or code pass-through.
+
+      validation_or_approval:
+        type: string
+        desc: Checks and human approval required before the transition takes effect.
+
+      execution_mode:
+        type: enum [synchronous, background, queued, repeated, callback, unknown]
+        desc: Whether the transition is immediate, asynchronous, retried, or callback-driven.
+
+      failure_behavior:
+        type: enum [fail_closed, fail_open, retry, fallback, abort, partial_effect, unknown]
+        desc: What happens on timeout, error, invalid output, or policy failure.
+
+      related_l1_ids:
+        type: list[string]
+        desc: L1 interactions involved in this transition.
+
+      related_l2_ids:
+        type: list[string]
+        desc: L2 operations that contain or depend on this transition.
+
+      evidence_status:
+        type: enum [observed, source_confirmed, inferred, unknown]
+        desc: How directly the transition and its conditions were verified.
+      visibility:
+        type: enum [black_box_observable, grey_box_required, white_box_required]
+        desc: >
+          Minimum access to understand *what this operation does*
+          semantically — distinct from L1 visibility (knowing the endpoint
+          exists) and from reachability (being able to trigger it). E.g. an
+          admin can black-box-observe that a "tool description" field exists
+          and is editable without grey/white-box access revealing that editing
+          it changes what an unrelated agent does three requests later.
+
+      reachability:
+        type: object {status, notes}
+        desc: >
+          Same status vocabulary as L1.reachability, but answering "can this
+          operation actually be triggered end-to-end in this deployment" —
+          e.g. an operation whose detector exists and whose L1 endpoints are
+          live, but whose triggering agent is behind an LLM_PROVIDER that
+          isn't configured, is white-box-confirmed-present but
+          black-box-unreachable until an API key is supplied.
+
+      source_ref:
+        type: string
+        desc: Source/config location supporting this record.
+
+      notes:
+        type: string
+        desc: Free-text caveats, including nondeterministic or incompletely explored branches.
+
+  controls:
+    record: One guardrail, policy, approval, or monitoring control affecting agent execution.
+    fields:
+      id:
+        type: string
+        desc: Stable identifier for the control.
+
+      control_kind:
+        type: enum [input_filter, output_filter, tool_policy, authorization, human_approval, rate_limit, monitoring, webhook, other]
+        desc: Control purpose.
+
+      applies_at:
+        type: enum [before_model, after_model, before_tool, after_tool, delegation, memory_read, memory_write, output_delivery, other]
+        desc: Execution point where the control runs.
+
+      enforcement_mode:
+        type: enum [blocking, modifying, advisory, observe_only, unknown]
+        desc: Whether the control can stop or change execution, or only report activity.
+
+      implementation:
+        type: enum [code, model_prompt, external_service, platform_config, human_process, unknown]
+        desc: Where enforcement is implemented.
+
+      failure_mode:
+        type: enum [fail_closed, fail_open, retry, bypass, unknown]
+        desc: Behavior when the control itself errors or times out.
+
+      applies_to_agent_ids:
+        type: list[string]
+        desc: Agents covered by this control.
+
+      related_l1_ids:
+        type: list[string]
+        desc: L1 interactions used to configure or observe the control.
+
+      related_l2_ids:
+        type: list[string]
+        desc: L2 operations affected by the control.
+
+      evidence_status:
+        type: enum [observed, source_confirmed, inferred, unknown]
+        desc: How directly enforcement behavior was verified.
+
+      source_ref:
+        type: string
+        desc: Source/config location supporting this record.
+
+      visibility:
+        type: enum [black_box_observable, grey_box_required, white_box_required]
+        desc: >
+          Minimum access to understand *what this operation does*
+          semantically — distinct from L1 visibility (knowing the endpoint
+          exists) and from reachability (being able to trigger it). E.g. an
+          admin can black-box-observe that a "tool description" field exists
+          and is editable without grey/white-box access revealing that editing
+          it changes what an unrelated agent does three requests later.
+
+      reachability:
+        type: object {status, notes}
+        desc: >
+          Same status vocabulary as L1.reachability, but answering "can this
+          operation actually be triggered end-to-end in this deployment" —
+          e.g. an operation whose detector exists and whose L1 endpoints are
+          live, but whose triggering agent is behind an LLM_PROVIDER that
+          isn't configured, is white-box-confirmed-present but
+          black-box-unreachable until an API key is supplied.
+
+      notes:
+        type: string
+        desc: Free-text caveats, such as a verdict being logged but not enforced.
+
+shared_fields:
+  related_l1_ids:
+    type: list[string]
+    desc: References to existing L1 interaction IDs; omit when no L1 interaction applies.
+
+  related_l2_ids:
+    type: list[string]
+    desc: References to existing L2 semantic-operation IDs; omit when no L2 operation applies.
+
+  evidence_status:
+    type: enum [observed, source_confirmed, inferred, unknown]
+    desc: Distinguishes live observation from source confirmation, inference, and unverified behavior.

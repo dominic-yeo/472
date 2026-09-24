@@ -1,0 +1,1202 @@
+agentic:
+  schema: Agentic_attack_surface_schema.yaml
+  agents:
+    - id: agent.vendor_chat
+      name: Vendor Chat Assistant
+      component: Vendor Portal / agent runtime
+      agent_kind: interactive
+      purpose: Answer current vendor questions, look up scoped business records, and start delegated workflows.
+      invocation_surfaces: [{l1_id: l1.vendor.chat, trigger: Vendor chat POST, auth_context: session and current vendor context}]
+      model_config: {provider: settings-backed LLM client, model: settings.LLM_DEFAULT_MODEL, deployment: environment configured, version: unknown, config_source: finbot/agents/chat.py and finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: first model input message, config_version: source code revision}]
+      tool_binding_ids: [tb.vendor.native, tb.vendor.findrive, tb.vendor.finmail, tb.vendor.systemutils]
+      context_source_ids: [ctx.system_prompts, ctx.user_message, ctx.chat_history, ctx.business_tool_results, ctx.mcp_descriptions]
+      memory_ids: [mem.chat_history, mem.workflow_context]
+      control_ids: [control.session_context, control.csrf, control.agent_hooks]
+      authority_context: {principal_source: SessionContext from signed session cookie, tenant_scope: namespace, resource_scope: current vendor for vendor-native data operations, delegated_identity: same SessionContext passed to tool callables and child workflow, authz_enforcement: route/repository/tool code; per-tool behavior is source-defined}
+      related_l2_ids: [l2.vendor.chat, l2.vendor.files, l2.vendor.payments, l2.vendor.email]
+      source_ref: finbot/agents/chat.py::VendorChatAssistant
+      evidence_status: source_confirmed
+      notes: Chat UI is present in source; live chat invocation and deployment model connectivity were not tested.
+
+    - id: agent.finance_copilot
+      name: Finance Co-Pilot
+      component: Admin Portal / agent runtime
+      agent_kind: interactive
+      purpose: Analyze namespace vendor, invoice, payment, inbox, compliance, and file data; prepare reports and start workflows.
+      invocation_surfaces: [{l1_id: l1.admin.copilot_chat, trigger: Admin Co-Pilot chat POST, auth_context: session and namespace context}]
+      model_config: {provider: settings-backed LLM client, model: settings.LLM_DEFAULT_MODEL, deployment: environment configured, version: unknown, config_source: finbot/agents/chat.py and finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: first model input message, config_version: source code revision}]
+      tool_binding_ids: [tb.copilot.native, tb.copilot.findrive, tb.copilot.finmail, tb.copilot.systemutils]
+      context_source_ids: [ctx.system_prompts, ctx.user_message, ctx.chat_history, ctx.business_tool_results, ctx.mcp_descriptions]
+      memory_ids: [mem.chat_history, mem.workflow_context, mem.file_data]
+      control_ids: [control.session_context, control.csrf, control.agent_hooks]
+      authority_context: {principal_source: SessionContext from signed session cookie, tenant_scope: namespace, resource_scope: namespace vendor and business records, delegated_identity: same SessionContext passed into tools and workflows, authz_enforcement: repository and tool code with namespace context}
+      related_l2_ids: [l2.admin.copilot, l2.admin.files, l2.admin.email, l2.admin.mcp_config]
+      source_ref: finbot/agents/chat.py::CoPilotAssistant
+      evidence_status: source_confirmed
+      notes: Admin Co-Pilot page rendered live; no prompt was submitted and no tool invocation was triggered.
+
+    - id: agent.orchestrator
+      name: Workflow Orchestrator
+      component: Agent runtime
+      agent_kind: orchestrator
+      purpose: Select and coordinate specialized agents for onboarding, invoice, fraud/compliance, payment, communication, and system maintenance tasks.
+      invocation_surfaces:
+        - {l1_id: l1.vendor.register, trigger: background task after vendor creation, auth_context: originating SessionContext}
+        - {l1_id: l1.vendor.create_invoice, trigger: background task after invoice creation, auth_context: originating SessionContext}
+        - {l1_id: l1.vendor.reprocess_invoice, trigger: background task after reprocess request, auth_context: originating SessionContext}
+        - {l1_id: l1.vendor.request_review, trigger: background task after review request, auth_context: originating SessionContext}
+        - {l1_id: l1.vendor.chat, trigger: chat start_workflow native tool, auth_context: originating SessionContext}
+        - {l1_id: l1.admin.copilot_chat, trigger: Co-Pilot start_workflow native tool, auth_context: originating SessionContext}
+      model_config: {provider: settings-backed agent LLM client, model: runtime configured, deployment: environment configured, version: unknown, config_source: finbot/agents/base.py; finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: base agent model prompt, config_version: source code revision}]
+      tool_binding_ids: [tb.orchestrator.delegation]
+      context_source_ids: [ctx.system_prompts, ctx.workflow_task, ctx.delegated_summaries, ctx.business_tool_results]
+      memory_ids: [mem.workflow_context, mem.vendor_data, mem.invoice_data]
+      control_ids: [control.session_context, control.agent_retry]
+      authority_context: {principal_source: originating SessionContext, tenant_scope: namespace, resource_scope: task vendor/invoice identifiers and tools provided to child agents, delegated_identity: same session passed to runner functions, authz_enforcement: agent tools and repository code}
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments, l2.vendor.chat, l2.admin.copilot]
+      source_ref: finbot/agents/orchestrator.py; finbot/agents/runner.py
+      evidence_status: source_confirmed
+      notes: System maintenance is a task mode routed through FraudComplianceAgent with SystemUtils, not a separate instantiated agent class.
+
+    - id: agent.onboarding
+      name: Vendor Onboarding Agent
+      component: Agent runtime
+      agent_kind: specialist
+      purpose: Read vendor profile data and produce/update onboarding status and related notes.
+      invocation_surfaces: [{l1_id: l1.vendor.register, trigger: Orchestrator delegation, auth_context: originating SessionContext}]
+      model_config: {provider: settings-backed agent LLM client, model: runtime configured, deployment: environment configured, version: unknown, config_source: finbot/agents/specialized/onboarding.py; finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: base agent model prompt, config_version: source code revision}]
+      tool_binding_ids: [tb.onboarding.native]
+      context_source_ids: [ctx.system_prompts, ctx.workflow_task, ctx.business_tool_results, ctx.delegated_summaries]
+      memory_ids: [mem.vendor_data, mem.workflow_context]
+      control_ids: [control.session_context, control.agent_retry]
+      authority_context: {principal_source: originating SessionContext, tenant_scope: namespace, resource_scope: vendor_id in delegated task, delegated_identity: originating session, authz_enforcement: repository/tool code}
+      related_l2_ids: [l2.vendor.register, l2.vendor.review]
+      source_ref: finbot/agents/specialized/onboarding.py
+      evidence_status: source_confirmed
+      notes: Native tools read vendor details and update vendor status; no separate MCP server is configured by this class.
+
+    - id: agent.invoice
+      name: Invoice Processing Agent
+      component: Agent runtime
+      agent_kind: specialist
+      purpose: Read invoice/vendor/file context, evaluate invoice processing, and update status and processing notes.
+      invocation_surfaces: [{l1_id: l1.vendor.create_invoice, trigger: Orchestrator delegation, auth_context: originating SessionContext}]
+      model_config: {provider: settings-backed agent LLM client, model: runtime configured, deployment: environment configured, version: unknown, config_source: finbot/agents/specialized/invoice.py; finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: base agent model prompt, config_version: source code revision}]
+      tool_binding_ids: [tb.invoice.native, tb.invoice.findrive, tb.invoice.taxcalc]
+      context_source_ids: [ctx.system_prompts, ctx.workflow_task, ctx.business_tool_results, ctx.file_content, ctx.mcp_descriptions]
+      memory_ids: [mem.invoice_data, mem.file_data, mem.workflow_context]
+      control_ids: [control.session_context, control.agent_retry]
+      authority_context: {principal_source: originating SessionContext, tenant_scope: namespace, resource_scope: invoice_id/vendor_id and referenced attachment file IDs, delegated_identity: originating session, authz_enforcement: agent tools/repository code}
+      related_l2_ids: [l2.vendor.invoices, l2.vendor.files, l2.vendor.payments]
+      source_ref: finbot/agents/specialized/invoice.py
+      evidence_status: source_confirmed
+      notes: Connects to TaxCalc and FinDrive when enabled for the namespace.
+
+    - id: agent.fraud_compliance
+      name: Fraud and Compliance Agent
+      component: Agent runtime
+      agent_kind: specialist
+      purpose: Assess vendor/invoice risk and compliance context; also services system maintenance tasks when delegated in that mode.
+      invocation_surfaces: [{l1_id: l1.vendor.register, trigger: Orchestrator delegation, auth_context: originating SessionContext}]
+      model_config: {provider: settings-backed agent LLM client, model: runtime configured, deployment: environment configured, version: unknown, config_source: finbot/agents/specialized/fraud.py; finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: base agent model prompt, config_version: source code revision}]
+      tool_binding_ids: [tb.fraud.native, tb.fraud.findrive, tb.fraud.finmail, tb.fraud.systemutils]
+      context_source_ids: [ctx.system_prompts, ctx.workflow_task, ctx.business_tool_results, ctx.file_content, ctx.mcp_descriptions, ctx.delegated_summaries]
+      memory_ids: [mem.vendor_data, mem.invoice_data, mem.file_data, mem.workflow_context]
+      control_ids: [control.session_context, control.agent_retry]
+      authority_context: {principal_source: originating SessionContext, tenant_scope: namespace, resource_scope: vendor_id/invoice_id plus tools enabled for namespace, delegated_identity: originating session, authz_enforcement: agent tools/repository code}
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.files]
+      source_ref: finbot/agents/specialized/fraud.py; finbot/agents/orchestrator.py
+      evidence_status: source_confirmed
+      notes: The orchestrator labels one delegation System Maintenance Agent but invokes this class and prefixes the task description with that mode.
+
+    - id: agent.payments
+      name: Payments Agent
+      component: Agent runtime
+      agent_kind: specialist
+      purpose: Read invoice/vendor/payment context and process eligible payment tasks through FinStripe.
+      invocation_surfaces: [{l1_id: l1.vendor.create_invoice, trigger: Orchestrator delegation following invoice processing, auth_context: originating SessionContext}]
+      model_config: {provider: settings-backed agent LLM client, model: runtime configured, deployment: environment configured, version: unknown, config_source: finbot/agents/specialized/payments.py; finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: base agent model prompt, config_version: source code revision}]
+      tool_binding_ids: [tb.payments.native, tb.payments.finstripe, tb.payments.taxcalc]
+      context_source_ids: [ctx.system_prompts, ctx.workflow_task, ctx.business_tool_results, ctx.mcp_descriptions, ctx.delegated_summaries]
+      memory_ids: [mem.invoice_data, mem.vendor_data, mem.payment_data, mem.workflow_context]
+      control_ids: [control.session_context, control.agent_retry]
+      authority_context: {principal_source: originating SessionContext, tenant_scope: namespace, resource_scope: invoice_id/vendor_id in task data, delegated_identity: originating session, authz_enforcement: agent tools and repository code}
+      related_l2_ids: [l2.vendor.payments, l2.vendor.invoices]
+      source_ref: finbot/agents/specialized/payments.py
+      evidence_status: source_confirmed
+      notes: Connects to FinStripe and TaxCalc when enabled for the namespace.
+
+    - id: agent.communication
+      name: Communication Agent
+      component: Agent runtime
+      agent_kind: specialist
+      purpose: Compose business notifications and route them through FinMail to vendor/admin inboxes or configured external email delivery.
+      invocation_surfaces: [{l1_id: l1.vendor.register, trigger: Orchestrator delegation, auth_context: originating SessionContext}]
+      model_config: {provider: settings-backed agent LLM client, model: runtime configured, deployment: environment configured, version: unknown, config_source: finbot/agents/specialized/communication.py; finbot/config.py, evidence_status: source_confirmed}
+      instruction_sources: [{surface_id: ctx.system_prompts, instruction_role: system, precedence: base agent model prompt, config_version: source code revision}]
+      tool_binding_ids: [tb.communication.native, tb.communication.finmail]
+      context_source_ids: [ctx.system_prompts, ctx.workflow_task, ctx.business_tool_results, ctx.mcp_descriptions, ctx.delegated_summaries]
+      memory_ids: [mem.email_data, mem.workflow_context]
+      control_ids: [control.session_context, control.agent_retry]
+      authority_context: {principal_source: originating SessionContext, tenant_scope: namespace, resource_scope: vendor recipient and message fields in delegated task, delegated_identity: originating session, authz_enforcement: agent tools and FinMail routing code}
+      related_l2_ids: [l2.vendor.email, l2.admin.email, l2.vendor.register, l2.vendor.invoices, l2.vendor.payments]
+      source_ref: finbot/agents/specialized/communication.py
+      evidence_status: source_confirmed
+
+  tool_bindings:
+    -
+      id: "tb.vendor.native"
+      agent_id: "agent.vendor_chat"
+      l1_id: l1.agent.native_tools
+      tool_name: "vendor-native-functions"
+      tool_source: "code"
+      server_or_provider: "finbot.tools"
+      schema_ref: "finbot/agents/chat.py"
+      description_source: "VendorChatAssistant tool definitions"
+      capabilities: ["get_vendor_details(vendor_id)", "get_invoice_details(invoice_id)", "get_vendor_invoices(vendor_id)", "get_vendor_payment_summary(vendor_id)", "get_vendor_contact_info(vendor_id)", "start_workflow(description, vendor_id, invoice_id?, attachment_file_ids?)"]
+      argument_handling: {validation: model function schemas and Python arguments, authorization: SessionContext passed to data helpers, normalization: tool result serialized as JSON, enforced_by: code and repository functions}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.chat, l2.vendor.invoices, l2.vendor.payments, l2.vendor.email]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Bound in source; actual LLM/provider configuration was not verified}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/chat.py"
+    -
+      id: "tb.copilot.native"
+      agent_id: "agent.finance_copilot"
+      l1_id: l1.agent.native_tools
+      tool_name: "finance-native-functions"
+      tool_source: "code"
+      server_or_provider: "finbot.tools and repositories"
+      schema_ref: "finbot/agents/chat.py"
+      description_source: "CoPilotAssistant tool definitions"
+      capabilities: ["list_vendors()", "get_vendor_details(vendor_id)", "get_invoice_details(invoice_id)", "get_vendor_invoices(vendor_id)", "get_vendor_payment_summary(vendor_id)", "get_vendor_contact_info(vendor_id)", "get_all_vendors_summary()", "get_pending_actions_summary()", "get_vendor_compliance_docs(vendor_id)", "get_vendor_activity_report(vendor_id)", "save_report(title, content, report_type)", "start_workflow(description, vendor_id, invoice_id?, attachment_file_ids?)"]
+      argument_handling: {validation: model function schemas and Python arguments, authorization: SessionContext/namespace passed to repository helpers, normalization: results serialized as JSON, enforced_by: code and repositories}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.admin.copilot, l2.admin.files, l2.admin.mcp_config]
+      visibility: "grey_box_required"
+      reachability: {status: observed, notes: Admin chat UI was rendered; no request was sent}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/chat.py"
+    -
+      id: "tb.orchestrator.delegation"
+      agent_id: "agent.orchestrator"
+      l1_id: l1.agent.native_tools
+      tool_name: "specialized-agent delegation functions"
+      tool_source: "code"
+      server_or_provider: "finbot/agents/runner.py"
+      schema_ref: "finbot/agents/orchestrator.py"
+      description_source: "OrchestratorAgent tool definitions"
+      capabilities: ["delegate_to_onboarding(vendor_id, task_description)", "delegate_to_invoice(invoice_id, task_description)", "delegate_to_fraud(vendor_id, task_description)", "delegate_to_payments(invoice_id, task_description)", "delegate_to_communication(vendor_id, task_description, notification_type, to_addresses?, cc_addresses?, bcc_addresses?)", "delegate_to_system_maintenance(vendor_id, task_description)", "complete_task(task_status, task_summary)"]
+      argument_handling: {validation: model function schemas and Python arguments, authorization: same SessionContext passed to runner/child agents, normalization: child result task_summary appended to in-memory workflow context, enforced_by: agent and runner code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments, l2.vendor.chat, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Invoked from source-defined background workflows; live execution was not tested}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/orchestrator.py"
+    -
+      id: "tb.vendor.findrive"
+      agent_id: "agent.vendor_chat"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinDrive tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server findrive"
+      schema_ref: "finbot/mcp/servers/findrive/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["upload_file(filename, content, folder, vendor_id, file_type)", "get_file(file_id)", "list_files(folder, vendor_id, limit)", "delete_file(file_id)", "search_files(query, limit)"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context/server repository scope, normalization: MCP JSON result, enforced_by: MCP server/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.files, l2.vendor.chat, l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement and live model tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/findrive/server.py"
+    -
+      id: "tb.vendor.finmail"
+      agent_id: "agent.vendor_chat"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinMail tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server finmail"
+      schema_ref: "finbot/mcp/servers/finmail/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["send_email(to, subject, body, message_type, sender_name, cc?, bcc?, related_invoice_id?)", "list_inbox(inbox, vendor_id, message_type, unread_only, limit)", "read_email(message_id)", "search_emails(query, inbox, vendor_id, limit)", "mark_as_read(message_id)"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context, namespace, and inbox routing code, normalization: MCP JSON result, enforced_by: MCP server and FinMail routing/repositories}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.email, l2.vendor.messages]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement and live model tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/finmail/server.py"
+    -
+      id: "tb.vendor.systemutils"
+      agent_id: "agent.vendor_chat"
+      l1_id: l1.mcp.runtime
+      tool_name: "SystemUtils tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server systemutils"
+      schema_ref: "finbot/mcp/servers/systemutils/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["run_diagnostics(command)", "manage_storage(action, target)", "rotate_logs(service, options)", "database_maintenance(query)", "network_request(url, method, headers, body)", "read_config(filepath)", "manage_users(action, username, role)", "execute_script(script_content, interpreter)"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context and server implementation, normalization: MCP JSON result, enforced_by: MCP server code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.chat]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement and live model tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/systemutils/server.py"
+    -
+      id: "tb.copilot.findrive"
+      agent_id: "agent.finance_copilot"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinDrive tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server findrive"
+      schema_ref: "finbot/mcp/servers/findrive/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["upload_file", "get_file", "list_files", "delete_file", "search_files"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context/repository scope, normalization: MCP JSON result, enforced_by: MCP server/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.admin.files, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement and live model tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/findrive/server.py"
+    -
+      id: "tb.copilot.finmail"
+      agent_id: "agent.finance_copilot"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinMail tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server finmail"
+      schema_ref: "finbot/mcp/servers/finmail/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["send_email", "list_inbox", "read_email", "search_emails", "mark_as_read"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context and inbox routing code, normalization: MCP JSON result, enforced_by: MCP server/routing/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.admin.email, l2.admin.messages, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement and live model tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/finmail/server.py"
+    -
+      id: "tb.copilot.systemutils"
+      agent_id: "agent.finance_copilot"
+      l1_id: l1.mcp.runtime
+      tool_name: "SystemUtils tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server systemutils"
+      schema_ref: "finbot/mcp/servers/systemutils/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["run_diagnostics", "manage_storage", "rotate_logs", "database_maintenance", "network_request", "read_config", "manage_users", "execute_script"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context and server implementation, normalization: MCP JSON result, enforced_by: MCP server code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement and live model tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/systemutils/server.py"
+    -
+      id: "tb.onboarding.native"
+      agent_id: "agent.onboarding"
+      l1_id: l1.agent.native_tools
+      tool_name: "onboarding native functions"
+      tool_source: "code"
+      server_or_provider: "finbot/agents/specialized/onboarding.py"
+      schema_ref: "finbot/agents/specialized/onboarding.py"
+      description_source: "agent tool definitions"
+      capabilities: ["get_vendor_details(vendor_id)", "update_vendor_status(vendor_id, status, trust_level, risk_level, agent_notes)", "complete_task(task_status, task_summary)"]
+      argument_handling: {validation: model tool schema and typed Python arguments, authorization: SessionContext and repository methods, normalization: structured dict result, enforced_by: agent/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.register, l2.vendor.review]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner invokes this agent in onboarding workflows; live execution unverified}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/specialized/onboarding.py"
+    -
+      id: "tb.invoice.native"
+      agent_id: "agent.invoice"
+      l1_id: l1.agent.native_tools
+      tool_name: "invoice native functions"
+      tool_source: "code"
+      server_or_provider: "finbot/agents/specialized/invoice.py"
+      schema_ref: "finbot/agents/specialized/invoice.py"
+      description_source: "agent tool definitions"
+      capabilities: ["get_invoice_details(invoice_id)", "update_invoice_status(invoice_id, status, agent_notes)", "get_vendor_details(vendor_id)", "complete_task(task_status, task_summary)"]
+      argument_handling: {validation: model tool schema and typed Python arguments, authorization: SessionContext and repository methods, normalization: structured dict result, enforced_by: agent/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner invokes this agent for invoice tasks; live execution unverified}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/specialized/invoice.py"
+    -
+      id: "tb.invoice.findrive"
+      agent_id: "agent.invoice"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinDrive tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server findrive"
+      schema_ref: "finbot/mcp/servers/findrive/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["upload_file", "get_file", "list_files", "delete_file", "search_files"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context/repository scope, normalization: MCP JSON result, enforced_by: MCP server/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.invoices, l2.vendor.files]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement is deployment state}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/findrive/server.py"
+    -
+      id: "tb.invoice.taxcalc"
+      agent_id: "agent.invoice"
+      l1_id: l1.mcp.runtime
+      tool_name: "TaxCalc tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server taxcalc"
+      schema_ref: "finbot/mcp/servers/taxcalc/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["calculate_tax(amount, jurisdiction, category)", "get_tax_rates(jurisdiction)", "validate_tax_id(tax_id, country)"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context, normalization: MCP JSON result, enforced_by: MCP server code}
+      effect_class: "read"
+      approval_required: false
+      related_l2_ids: [l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement is deployment state}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/taxcalc/server.py"
+    -
+      id: "tb.fraud.native"
+      agent_id: "agent.fraud_compliance"
+      l1_id: l1.agent.native_tools
+      tool_name: "fraud native functions"
+      tool_source: "code"
+      server_or_provider: "finbot/agents/specialized/fraud.py"
+      schema_ref: "finbot/agents/specialized/fraud.py"
+      description_source: "agent tool definitions"
+      capabilities: ["get_vendor_risk_profile(vendor_id)", "get_invoice_details(invoice_id)", "get_vendor_invoices(vendor_id)", "update_vendor_risk(vendor_id, risk_level, agent_notes)", "flag_invoice_for_review(invoice_id, flag_reason, recommended_action, agent_notes)", "complete_task(task_status, task_summary)"]
+      argument_handling: {validation: model tool schema and typed Python arguments, authorization: SessionContext and repository methods, normalization: structured dict result, enforced_by: agent/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner invokes this agent for review tasks; live execution unverified}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/specialized/fraud.py"
+    -
+      id: "tb.fraud.findrive"
+      agent_id: "agent.fraud_compliance"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinDrive tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server findrive"
+      schema_ref: "finbot/mcp/servers/findrive/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["upload_file", "get_file", "list_files", "delete_file", "search_files"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context/repository scope, normalization: MCP JSON result, enforced_by: MCP server/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.files, l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement is deployment state}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/findrive/server.py"
+    -
+      id: "tb.fraud.finmail"
+      agent_id: "agent.fraud_compliance"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinMail tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server finmail"
+      schema_ref: "finbot/mcp/servers/finmail/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["send_email", "list_inbox", "read_email", "search_emails", "mark_as_read"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context and inbox routing code, normalization: MCP JSON result, enforced_by: MCP server/routing/repository code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.email, l2.vendor.messages]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement is deployment state}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/finmail/server.py"
+    -
+      id: "tb.fraud.systemutils"
+      agent_id: "agent.fraud_compliance"
+      l1_id: l1.mcp.runtime
+      tool_name: "SystemUtils tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server systemutils"
+      schema_ref: "finbot/mcp/servers/systemutils/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["run_diagnostics", "manage_storage", "rotate_logs", "database_maintenance", "network_request", "read_config", "manage_users", "execute_script"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context and server implementation, normalization: MCP JSON result, enforced_by: MCP server code}
+      effect_class: "mixed"
+      approval_required: false
+      related_l2_ids: [l2.vendor.review, l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement is deployment state}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/systemutils/server.py"
+    -
+      id: "tb.payments.native"
+      agent_id: "agent.payments"
+      l1_id: l1.agent.native_tools
+      tool_name: "payment native functions"
+      tool_source: "code"
+      server_or_provider: "finbot/agents/specialized/payments.py"
+      schema_ref: "finbot/agents/specialized/payments.py"
+      description_source: "agent tool definitions"
+      capabilities: ["get_invoice_for_payment(invoice_id)", "get_vendor_details(vendor_id)", "get_vendor_payment_summary(vendor_id)", "process_payment(invoice_id, payment_method, payment_reference, agent_notes)", "complete_task(task_status, task_summary)"]
+      argument_handling: {validation: model tool schema and typed Python arguments, authorization: SessionContext and repository methods, normalization: structured dict result, enforced_by: agent/repository code}
+      effect_class: "financial"
+      approval_required: false
+      related_l2_ids: [l2.vendor.payments]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner invokes this agent after invoice workflows; live execution unverified}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/specialized/payments.py"
+    -
+      id: "tb.payments.finstripe"
+      agent_id: "agent.payments"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinStripe tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server finstripe"
+      schema_ref: "finbot/mcp/servers/finstripe/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["create_transfer(vendor_account, amount, invoice_reference, vendor_id, invoice_id, payment_method, currency, description)", "get_transfer(transfer_id)", "get_account_balance(account_id)", "list_transfers(vendor_id, limit)"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context/config/repository code, normalization: MCP JSON result, enforced_by: MCP server/repository code}
+      effect_class: "financial"
+      approval_required: false
+      related_l2_ids: [l2.vendor.payments]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement and live tool invocation were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/finstripe/server.py"
+    -
+      id: "tb.payments.taxcalc"
+      agent_id: "agent.payments"
+      l1_id: l1.mcp.runtime
+      tool_name: "TaxCalc tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server taxcalc"
+      schema_ref: "finbot/mcp/servers/taxcalc/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["calculate_tax", "get_tax_rates", "validate_tax_id"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context, normalization: MCP JSON result, enforced_by: MCP server code}
+      effect_class: "read"
+      approval_required: false
+      related_l2_ids: [l2.vendor.payments]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement is deployment state}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/taxcalc/server.py"
+    -
+      id: "tb.communication.native"
+      agent_id: "agent.communication"
+      l1_id: l1.agent.native_tools
+      tool_name: "communication native functions"
+      tool_source: "code"
+      server_or_provider: "finbot/agents/specialized/communication.py"
+      schema_ref: "finbot/agents/specialized/communication.py"
+      description_source: "agent tool definitions"
+      capabilities: ["get_vendor_contact_info(vendor_id)", "get_vendor_details(vendor_id)", "get_invoice_details(invoice_id)", "complete_task(task_status, task_summary)"]
+      argument_handling: {validation: model tool schema and typed Python arguments, authorization: SessionContext and repository methods, normalization: structured dict result, enforced_by: agent/repository code}
+      effect_class: "read"
+      approval_required: false
+      related_l2_ids: [l2.vendor.email, l2.admin.email]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner invokes this agent after workflow decisions; live execution unverified}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/specialized/communication.py"
+    -
+      id: "tb.communication.finmail"
+      agent_id: "agent.communication"
+      l1_id: l1.mcp.runtime
+      tool_name: "FinMail tools"
+      tool_source: "mcp"
+      server_or_provider: "namespace-scoped FastMCP server finmail"
+      schema_ref: "finbot/mcp/servers/finmail/server.py"
+      description_source: "server tool descriptions plus configured server data"
+      capabilities: ["send_email", "list_inbox", "read_email", "search_emails", "mark_as_read"]
+      argument_handling: {validation: discovered MCP input schema, authorization: session context and inbox routing code, normalization: MCP JSON result, enforced_by: MCP server/routing/repository code}
+      effect_class: "external_send"
+      approval_required: false
+      related_l2_ids: [l2.vendor.email, l2.admin.email]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Namespace server enablement and delivery configuration were not checked}
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/servers/finmail/server.py"
+
+  context_sources:
+    -
+      id: "ctx.system_prompts"
+      source_kind: "system_prompt"
+      source_ref: "agent prompt methods in finbot/agents/chat.py and finbot/agents/specialized/"
+      destination_agent_ids: [agent.vendor_chat, agent.finance_copilot, agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      destination_channel: "system"
+      provenance: "application source/config"
+      trust_class: "trusted_instruction"
+      transformation: "formatted with current date, namespace-derived addresses, and agent-specific text where applicable"
+      persistence_scope: "none"
+      related_l2_ids: [l2.vendor.chat, l2.admin.copilot, l2.vendor.register, l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Prompt methods are present; runtime provider not verified}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.user_message"
+      source_kind: "user_input"
+      source_ref: "ChatRequest.message and workflow task description fields"
+      destination_agent_ids: [agent.vendor_chat, agent.finance_copilot, agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      destination_channel: "user"
+      provenance: "vendor/admin session or originating application workflow"
+      trust_class: "untrusted_data"
+      transformation: "JSON validation for chat request; task_data passed as structured fields; workflow prompt composition"
+      persistence_scope: "session"
+      related_l2_ids: [l2.vendor.chat, l2.admin.copilot, l2.vendor.register, l2.vendor.review, l2.vendor.invoices]
+      visibility: "black_box_observable"
+      reachability: {status: observed, notes: Chat interfaces visible; no prompt submitted}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.workflow_task"
+      source_kind: "user_input"
+      source_ref: "task_data.description plus vendor_id/invoice_id/attachment_file_ids in agent runner calls"
+      destination_agent_ids: [agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      destination_channel: "user"
+      provenance: "vendor/admin API operation or parent-agent delegation"
+      trust_class: "mixed"
+      transformation: "route-created task_data dictionaries passed to OrchestratorAgent; child descriptions may include prior delegated summaries"
+      persistence_scope: "workflow"
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner and delegation task_data wiring found}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.chat_history"
+      source_kind: "chat_history"
+      source_ref: "ChatMessageRepository.get_history"
+      destination_agent_ids: [agent.vendor_chat, agent.finance_copilot]
+      destination_channel: "user"
+      provenance: "prior messages associated with current session context"
+      trust_class: "mixed"
+      transformation: "role/content list capped by requested limit and assistant max history"
+      persistence_scope: "session"
+      related_l2_ids: [l2.vendor.chat, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: History routes and repository calls are present}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.business_tool_results"
+      source_kind: "tool_result"
+      source_ref: "finbot/tools/data/, repositories, and MCP tool results"
+      destination_agent_ids: [agent.vendor_chat, agent.finance_copilot, agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      destination_channel: "tool"
+      provenance: "namespace database and configured MCP services"
+      trust_class: "untrusted_data"
+      transformation: "JSON/string serialization and appended function_call_output"
+      persistence_scope: "turn"
+      related_l2_ids: [l2.vendor.dashboard, l2.vendor.invoices, l2.vendor.payments, l2.vendor.messages, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Available through source-defined native and MCP tools; runtime server state unknown}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.file_content"
+      source_kind: "document"
+      source_ref: "FinDrive file content and invoice attachment_file_ids"
+      destination_agent_ids: [agent.vendor_chat, agent.invoice, agent.fraud_compliance, agent.finance_copilot]
+      destination_channel: "tool"
+      provenance: "vendor/admin file records and attachment references"
+      trust_class: "untrusted_data"
+      transformation: "file lookup and text/metadata result serialized for tool output"
+      persistence_scope: "tenant"
+      related_l2_ids: [l2.vendor.files, l2.vendor.invoices, l2.admin.files, l2.admin.copilot]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: File APIs and agent FinDrive bindings are source-defined}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.mcp_descriptions"
+      source_kind: "tool_result"
+      source_ref: "MCPToolProvider.connect and namespace MCP server config"
+      destination_agent_ids: [agent.vendor_chat, agent.finance_copilot, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      destination_channel: "tool"
+      provenance: "FastMCP server tool definitions and server configuration"
+      trust_class: "mixed"
+      transformation: "tools/list schemas become namespaced function definitions supplied to LLM client"
+      persistence_scope: "workflow"
+      related_l2_ids: [l2.admin.mcp_config, l2.vendor.chat, l2.admin.copilot, l2.vendor.invoices]
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Actual enabled-server config was not observed}
+      evidence_status: "source_confirmed"
+    -
+      id: "ctx.delegated_summaries"
+      source_kind: "delegated_summary"
+      source_ref: "OrchestratorAgent._workflow_context and _enrich_with_prior_context"
+      destination_agent_ids: [agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      destination_channel: "user"
+      provenance: "prior child-agent task_summary values"
+      trust_class: "mixed"
+      transformation: "appended as labeled prior workflow context in later task descriptions"
+      persistence_scope: "workflow"
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments]
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: In-memory workflow context implementation found in orchestrator source}
+      evidence_status: "source_confirmed"
+
+  memory_stores:
+    -
+      id: "mem.sessions"
+      store_kind: "database"
+      owner_component: "SessionManager and UserSession persistence"
+      readers: [all app routes, all agent tools]
+      writers: [SessionMiddleware, authentication routes]
+      scope: "user"
+      write_provenance: "Middleware-created temporary sessions and verified magic-link sessions"
+      read_path: "session cookie resolves SessionContext containing namespace/current vendor/CSRF values"
+      retention_and_deletion: "expiry and logout/session replacement handled by session code"
+      related_l2_ids: [l2.auth.session, l2.vendor.context]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Session middleware is installed in finbot/main.py}
+    -
+      id: "mem.chat_history"
+      store_kind: "conversation_history"
+      owner_component: "ChatMessageRepository"
+      readers: [agent.vendor_chat, agent.finance_copilot]
+      writers: [agent.vendor_chat, agent.finance_copilot]
+      scope: "session"
+      write_provenance: "user and assistant chat messages"
+      read_path: "history query filtered by SessionContext then loaded into model input"
+      retention_and_deletion: "clear-history API; list limited by request/assistant configuration; no TTL confirmed"
+      related_l2_ids: [l2.vendor.chat, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Read/write/clear calls found in chat.py and both API routers}
+    -
+      id: "mem.workflow_context"
+      store_kind: "agent_notes"
+      owner_component: "OrchestratorAgent instance"
+      readers: [agent.orchestrator and delegated agents]
+      writers: [agent.orchestrator]
+      scope: "workflow"
+      write_provenance: "child task_summary results captured during delegation"
+      read_path: "summaries appended to the next delegated task description"
+      retention_and_deletion: "in-memory instance state ends with workflow"
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Workflow-local list in orchestrator source}
+    -
+      id: "mem.vendor_data"
+      store_kind: "database"
+      owner_component: "VendorRepository and SQLAlchemy models"
+      readers: [vendor routes, Co-Pilot tools, vendor assistant tools, specialized agents]
+      writers: [vendor routes, onboarding/fraud tools]
+      scope: "tenant"
+      write_provenance: "registration/profile UI and agent status/risk operations"
+      read_path: "repositories receive SessionContext and vendor identifiers"
+      retention_and_deletion: "application database lifecycle; vendor delete route exists"
+      related_l2_ids: [l2.vendor.context, l2.vendor.register, l2.vendor.profile, l2.vendor.dashboard, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Repository/model code found}
+    -
+      id: "mem.invoice_data"
+      store_kind: "database"
+      owner_component: "InvoiceRepository and SQLAlchemy models"
+      readers: "vendor routes, Co-Pilot tools, invoice/fraud/payment agents"
+      writers: "vendor invoice routes and invoice/fraud tools"
+      scope: "tenant"
+      write_provenance: "vendor invoice form and agent processing tools"
+      read_path: "invoice_id or current-vendor repository queries"
+      retention_and_deletion: "application database lifecycle; no invoice delete route in vendor API"
+      related_l2_ids: [l2.vendor.dashboard, l2.vendor.invoices, l2.vendor.payments, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Repository/model code found}
+    -
+      id: "mem.file_data"
+      store_kind: "database"
+      owner_component: "FinDriveFileRepository"
+      readers: "vendor/admin file routes and agents with FinDrive tools"
+      writers: "vendor file routes, Co-Pilot report tool, and agent FinDrive tools"
+      scope: "tenant"
+      write_provenance: "vendor content uploads, agent tool calls, report generation"
+      read_path: "file_id, folder, vendor_id, or search query passed to repository/server"
+      retention_and_deletion: "vendor file delete API/tool exists; admin API is read-only"
+      related_l2_ids: [l2.vendor.files, l2.vendor.invoices, l2.vendor.chat, l2.admin.files, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: FinDrive repository/server and APIs found}
+    -
+      id: "mem.email_data"
+      store_kind: "database"
+      owner_component: "EmailRepository and FinMail routing"
+      readers: "vendor/admin inboxes and agents with FinMail tools"
+      writers: "portal email routes and communication tools"
+      scope: "tenant"
+      write_provenance: "portal messages, agent messages, and configured delivery processing"
+      read_path: "inbox/vendor_id/message_id/filter arguments"
+      retention_and_deletion: "read state updates available; message deletion route not found"
+      related_l2_ids: [l2.vendor.messages, l2.vendor.email, l2.admin.messages, l2.admin.email]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Repository and routes found}
+    -
+      id: "mem.payment_data"
+      store_kind: "database"
+      owner_component: "PaymentTransactionRepository and FinStripe server"
+      readers: "vendor payment views, dashboard, Co-Pilot and payment tools"
+      writers: "PaymentsAgent through FinStripe transfer tool"
+      scope: "tenant"
+      write_provenance: "agent transfer operation"
+      read_path: "vendor_id, invoice_id, or transfer_id lookups"
+      retention_and_deletion: "no payment deletion endpoint found"
+      related_l2_ids: [l2.vendor.dashboard, l2.vendor.payments, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Repository and server code found}
+    -
+      id: "mem.mcp_config"
+      store_kind: "database"
+      owner_component: "MCPServerConfigRepository"
+      readers: "Admin API, MCP factory, and agent runtime"
+      writers: "Admin config routes"
+      scope: "tenant"
+      write_provenance: "namespace-admin server config/update/toggle inputs"
+      read_path: "server_type plus SessionContext namespace; factory uses enabled/config values to instantiate a server"
+      retention_and_deletion: "update and toggle routes; deletion route not found"
+      related_l2_ids: [l2.admin.mcp_config, l2.vendor.chat, l2.admin.copilot, l2.vendor.invoices]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Repository and factory found}
+    -
+      id: "mem.mcp_activity_log"
+      store_kind: "database"
+      owner_component: "MCPActivityLogRepository"
+      readers: "Admin MCP activity API and page"
+      writers: "MCPToolProvider request/response logging"
+      scope: "tenant"
+      write_provenance: "MCP tools/list and tools/call lifecycle in connected agent runtime"
+      read_path: "optional server_type/workflow_id and limit/offset queries"
+      retention_and_deletion: "no deletion route found"
+      related_l2_ids: [l2.admin.mcp_activity]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Activity repository and API are source-defined}
+
+  execution_edges:
+    -
+      id: "edge.registration_to_orchestrator"
+      source: {agent_id: null, step: POST vendor registration route}
+      destination: {agent_id: agent.orchestrator, tool_binding_id: null}
+      decision_maker: "deterministic_code"
+      condition: "vendor record creation succeeds"
+      input_source_ids: [ctx.user_message]
+      argument_sources: "route-created vendor_id, fixed description, SessionContext, generated workflow_id"
+      validation_or_approval: "request model validation and repository call"
+      execution_mode: "background"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.vendor.register]
+      related_l2_ids: [l2.vendor.register]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: BackgroundTasks runner call in route source}
+      source_ref: "finbot/apps/vendor/routes/api.py; finbot/agents/runner.py"
+    -
+      id: "edge.orchestrator_to_specialist"
+      source: {agent_id: agent.orchestrator, step: task planning and delegation tool selection}
+      destination: {agent_id: agent.onboarding, tool_binding_id: tb.onboarding.native}
+      decision_maker: "llm"
+      condition: "delegated task category and current workflow context"
+      input_source_ids: [ctx.workflow_task, ctx.delegated_summaries]
+      argument_sources: "task_data identifiers and task_description passed to runner; session_context and workflow_id forwarded"
+      validation_or_approval: "tool schema and runner typed call"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.vendor.register, l1.vendor.create_invoice, l1.vendor.request_review]
+      related_l2_ids: [l2.vendor.register, l2.vendor.review]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner and delegation methods found}
+      source_ref: "finbot/agents/orchestrator.py; finbot/agents/runner.py"
+    -
+      id: "edge.orchestrator_to_invoice"
+      source: {agent_id: agent.orchestrator, step: workflow task routing}
+      destination: {agent_id: agent.invoice, tool_binding_id: tb.invoice.native}
+      decision_maker: "llm"
+      condition: "task categorized as invoice processing"
+      input_source_ids: [ctx.workflow_task, ctx.delegated_summaries]
+      argument_sources: "invoice_id and enriched task_description; attachment_file_ids are copied from the orchestrator current task when present"
+      validation_or_approval: "tool schema and run_invoice_agent arguments"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.agent.native_tools, l1.vendor.create_invoice, l1.vendor.reprocess_invoice]
+      related_l2_ids: [l2.vendor.invoices]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Delegation and runner methods are source-defined}
+      source_ref: "finbot/agents/orchestrator.py; finbot/agents/runner.py"
+    -
+      id: "edge.orchestrator_to_fraud"
+      source: {agent_id: agent.orchestrator, step: workflow task routing}
+      destination: {agent_id: agent.fraud_compliance, tool_binding_id: tb.fraud.native}
+      decision_maker: "llm"
+      condition: "task categorized as risk or compliance review"
+      input_source_ids: [ctx.workflow_task, ctx.delegated_summaries]
+      argument_sources: "vendor_id and enriched task_description; optional attachment_file_ids copied from current task"
+      validation_or_approval: "tool schema and run_fraud_agent arguments"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.agent.native_tools, l1.vendor.register, l1.vendor.request_review, l1.vendor.create_invoice]
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Delegation and runner methods are source-defined}
+      source_ref: "finbot/agents/orchestrator.py; finbot/agents/runner.py"
+    -
+      id: "edge.orchestrator_to_payments"
+      source: {agent_id: agent.orchestrator, step: workflow task routing}
+      destination: {agent_id: agent.payments, tool_binding_id: tb.payments.native}
+      decision_maker: "llm"
+      condition: "invoice workflow includes a payment task"
+      input_source_ids: [ctx.workflow_task, ctx.delegated_summaries, ctx.business_tool_results]
+      argument_sources: "invoice_id and enriched task_description passed with SessionContext and workflow_id"
+      validation_or_approval: "tool schema and run_payments_agent arguments"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.agent.native_tools, l1.vendor.create_invoice, l1.vendor.reprocess_invoice]
+      related_l2_ids: [l2.vendor.invoices, l2.vendor.payments]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Delegation and runner methods are source-defined}
+      source_ref: "finbot/agents/orchestrator.py; finbot/agents/runner.py"
+    -
+      id: "edge.orchestrator_to_communication"
+      source: {agent_id: agent.orchestrator, step: workflow notification routing}
+      destination: {agent_id: agent.communication, tool_binding_id: tb.communication.native}
+      decision_maker: "llm"
+      condition: "workflow includes a business notification"
+      input_source_ids: [ctx.workflow_task, ctx.delegated_summaries, ctx.business_tool_results]
+      argument_sources: "vendor_id, task_description, notification_type, and optional to/cc/bcc lists become communication task_data"
+      validation_or_approval: "tool schema and run_communication_agent arguments"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.agent.native_tools, l1.vendor.register, l1.vendor.request_review, l1.vendor.create_invoice]
+      related_l2_ids: [l2.vendor.email, l2.admin.email, l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Delegation and runner methods are source-defined}
+      source_ref: "finbot/agents/orchestrator.py; finbot/agents/runner.py"
+    -
+      id: "edge.system_maintenance_mode"
+      source: {agent_id: agent.orchestrator, step: system maintenance task routing}
+      destination: {agent_id: agent.fraud_compliance, tool_binding_id: tb.fraud.systemutils}
+      decision_maker: "llm"
+      condition: "orchestrator selects system maintenance delegation"
+      input_source_ids: [ctx.workflow_task, ctx.delegated_summaries, ctx.mcp_descriptions]
+      argument_sources: "vendor_id and task_description are passed to run_fraud_agent; a system-maintenance prefix and SystemUtils tool names are added to the task description"
+      validation_or_approval: "delegation tool schema and run_fraud_agent arguments"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.agent.native_tools, l1.mcp.runtime]
+      related_l2_ids: [l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: SystemUtils namespace enablement and tool invocation were not observed}
+      source_ref: "finbot/agents/orchestrator.py; finbot/agents/specialized/fraud.py"
+    -
+      id: "edge.invoice_to_agent"
+      source: {agent_id: null, step: invoice create or reprocess route}
+      destination: {agent_id: agent.orchestrator, tool_binding_id: null}
+      decision_maker: "deterministic_code"
+      condition: "invoice create/reprocess request accepted"
+      input_source_ids: [ctx.user_message, ctx.file_content]
+      argument_sources: "invoice_id/vendor_id/description/workflow_id; optional attachment.file_id list becomes attachment_file_ids"
+      validation_or_approval: "request model and vendor-context code"
+      execution_mode: "background"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.vendor.create_invoice, l1.vendor.reprocess_invoice]
+      related_l2_ids: [l2.vendor.invoices]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Background orchestrator call in route source}
+      source_ref: "finbot/apps/vendor/routes/api.py"
+    -
+      id: "edge.invoice_review_chain"
+      source: {agent_id: agent.orchestrator, step: invoice processing workflow}
+      destination: {agent_id: agent.invoice, tool_binding_id: tb.invoice.native}
+      decision_maker: "llm"
+      condition: "task categorized as invoice processing"
+      input_source_ids: [ctx.workflow_task, ctx.file_content, ctx.delegated_summaries]
+      argument_sources: "invoice_id and description; attachment_file_ids copied from orchestrator current task when set"
+      validation_or_approval: "tool schema and runner function"
+      execution_mode: "synchronous"
+      failure_behavior: "retry"
+      related_l1_ids: [l1.vendor.create_invoice, l1.vendor.reprocess_invoice]
+      related_l2_ids: [l2.vendor.invoices]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Delegation method and invoice agent are source-defined}
+      source_ref: "finbot/agents/orchestrator.py"
+    -
+      id: "edge.agent_to_mcp"
+      source: {agent_id: agent.invoice, step: model function call for MCP capability}
+      destination: {agent_id: null, tool_binding_id: tb.invoice.findrive}
+      decision_maker: "llm"
+      condition: "discovered MCP tool selected by agent model"
+      input_source_ids: [ctx.business_tool_results, ctx.file_content, ctx.mcp_descriptions]
+      argument_sources: "MCP input schema is converted to namespaced tool definition; arguments passed through MCPToolProvider.call_tool(original_name, kwargs)"
+      validation_or_approval: "discovered input schema; tool-level code handles arguments; no separate human approval found"
+      execution_mode: "synchronous"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.mcp.runtime, l1.vendor.create_invoice, l1.vendor.chat]
+      related_l2_ids: [l2.vendor.files, l2.vendor.invoices, l2.vendor.chat]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Live server enablement and model call not checked}
+      source_ref: "finbot/mcp/provider.py; finbot/mcp/factory.py"
+    -
+      id: "edge.chat_to_model"
+      source: {agent_id: null, step: vendor chat endpoint}
+      destination: {agent_id: agent.vendor_chat, tool_binding_id: null}
+      decision_maker: "deterministic_code"
+      condition: "POST chat request reaches assistant endpoint"
+      input_source_ids: [ctx.user_message, ctx.chat_history]
+      argument_sources: "request message and optional attachment references plus session context; histories and prompt assembled into model input"
+      validation_or_approval: "Pydantic request model and session/CSRF middleware"
+      execution_mode: "synchronous"
+      failure_behavior: "abort"
+      related_l1_ids: [l1.vendor.chat]
+      related_l2_ids: [l2.vendor.chat]
+      evidence_status: "source_confirmed"
+      visibility: "black_box_observable"
+      reachability: {status: observed, notes: Chat UI rendered live; no chat request submitted}
+      source_ref: "finbot/agents/chat.py"
+    -
+      id: "edge.copilot_chat_to_model"
+      source: {agent_id: null, step: Admin Co-Pilot chat endpoint}
+      destination: {agent_id: agent.finance_copilot, tool_binding_id: null}
+      decision_maker: "deterministic_code"
+      condition: "POST Co-Pilot chat request reaches assistant endpoint"
+      input_source_ids: [ctx.user_message, ctx.chat_history]
+      argument_sources: "ChatRequest.message and session context are combined with Co-Pilot system prompt and history for the model client"
+      validation_or_approval: "Pydantic request model and session/CSRF middleware"
+      execution_mode: "synchronous"
+      failure_behavior: "abort"
+      related_l1_ids: [l1.admin.copilot_chat]
+      related_l2_ids: [l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "black_box_observable"
+      reachability: {status: observed, notes: Admin Co-Pilot UI rendered; no chat request submitted}
+      source_ref: "finbot/apps/admin/routes/api.py; finbot/agents/chat.py"
+    -
+      id: "edge.chat_tool_cycle"
+      source: {agent_id: agent.vendor_chat, step: model function-call output}
+      destination: {agent_id: agent.vendor_chat, tool_binding_id: tb.vendor.native}
+      decision_maker: "llm"
+      condition: "Model response includes a function call"
+      input_source_ids: [ctx.user_message, ctx.chat_history, ctx.business_tool_results, ctx.mcp_descriptions]
+      argument_sources: "function name and JSON arguments select native callable or namespaced MCP callable; tool result appended as function_call_output"
+      validation_or_approval: "tool schema, guardrail hooks, and callable dispatch"
+      execution_mode: "synchronous"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.agent.native_tools, l1.mcp.runtime, l1.vendor.chat]
+      related_l2_ids: [l2.vendor.chat]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: No live tool call attempted}
+      source_ref: "finbot/agents/chat.py; finbot/mcp/provider.py"
+    -
+      id: "edge.copilot_tool_cycle"
+      source: {agent_id: agent.finance_copilot, step: model function-call output}
+      destination: {agent_id: agent.finance_copilot, tool_binding_id: tb.copilot.native}
+      decision_maker: "llm"
+      condition: "Co-Pilot model response includes a native or namespaced MCP function call"
+      input_source_ids: [ctx.user_message, ctx.chat_history, ctx.business_tool_results, ctx.file_content, ctx.mcp_descriptions]
+      argument_sources: "Function name and JSON arguments select a Co-Pilot native callable or an MCPToolProvider callable; serialized tool output is appended to model input"
+      validation_or_approval: "tool schemas, configured guardrail hooks, and callable dispatch"
+      execution_mode: "synchronous"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.agent.native_tools, l1.mcp.runtime, l1.admin.copilot_chat]
+      related_l2_ids: [l2.admin.copilot, l2.admin.files, l2.admin.email]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: No live model tool call attempted}
+      source_ref: "finbot/agents/chat.py; finbot/mcp/provider.py"
+    -
+      id: "edge.chat_workflow_start"
+      source: {agent_id: agent.vendor_chat, step: start_workflow native function}
+      destination: {agent_id: agent.orchestrator, tool_binding_id: null}
+      decision_maker: "llm"
+      condition: "assistant invokes start_workflow and background task queue is available"
+      input_source_ids: [ctx.user_message, ctx.chat_history]
+      argument_sources: "description/vendor_id plus optional invoice_id/attachment_file_ids; parent workflow ID and new child workflow ID added by assistant"
+      validation_or_approval: "native function argument schema"
+      execution_mode: "background"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.vendor.chat]
+      related_l2_ids: [l2.vendor.chat]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Function and BackgroundTasks wiring are source-defined}
+      source_ref: "finbot/agents/chat.py"
+    -
+      id: "edge.copilot_workflow_start"
+      source: {agent_id: agent.finance_copilot, step: start_workflow native function}
+      destination: {agent_id: agent.orchestrator, tool_binding_id: null}
+      decision_maker: "llm"
+      condition: "Co-Pilot invokes start_workflow and background task queue is available"
+      input_source_ids: [ctx.user_message, ctx.chat_history, ctx.business_tool_results]
+      argument_sources: "description/vendor_id and optional invoice_id/attachment_file_ids; parent workflow ID and child workflow ID are added by assistant"
+      validation_or_approval: "native function argument schema"
+      execution_mode: "background"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.admin.copilot_chat, l1.agent.native_tools]
+      related_l2_ids: [l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: start_workflow wiring is source-defined}
+      source_ref: "finbot/agents/chat.py"
+    -
+      id: "edge.payment_to_finstripe"
+      source: {agent_id: agent.payments, step: payment processing tool}
+      destination: {agent_id: null, tool_binding_id: tb.payments.finstripe}
+      decision_maker: "llm"
+      condition: "PaymentsAgent selects transfer capability during a delegated task"
+      input_source_ids: [ctx.workflow_task, ctx.business_tool_results, ctx.mcp_descriptions]
+      argument_sources: "invoice/vendor records become vendor_account, amount, invoice_reference, vendor_id, invoice_id, payment_method, currency, description; FinStripe persists transfer/transaction state"
+      validation_or_approval: "discovered tool schema and server config, no separate human approval found"
+      execution_mode: "synchronous"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.vendor.create_invoice, l1.vendor.reprocess_invoice]
+      related_l2_ids: [l2.vendor.payments]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Server enablement not observed}
+      source_ref: "finbot/agents/specialized/payments.py; finbot/mcp/servers/finstripe/server.py"
+    -
+      id: "edge.communication_to_finmail"
+      source: {agent_id: agent.communication, step: notification composition}
+      destination: {agent_id: null, tool_binding_id: tb.communication.finmail}
+      decision_maker: "llm"
+      condition: "communication task produces a notification action"
+      input_source_ids: [ctx.workflow_task, ctx.business_tool_results, ctx.delegated_summaries]
+      argument_sources: "vendor/contact/invoice data and notification type become recipients, subject, body, sender, related invoice ID, and optional cc/bcc fields"
+      validation_or_approval: "discovered tool schema and FinMail route/delivery code"
+      execution_mode: "synchronous"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.vendor.send_message, l1.admin.send_message]
+      related_l2_ids: [l2.vendor.email, l2.admin.email]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Provider configuration and live delivery not observed}
+      source_ref: "finbot/agents/specialized/communication.py; finbot/mcp/servers/finmail/server.py"
+    -
+      id: "edge.admin_config_to_agent_runtime"
+      source: {agent_id: null, step: admin MCP server config update/toggle}
+      destination: {agent_id: agent.finance_copilot, tool_binding_id: tb.copilot.findrive}
+      decision_maker: "deterministic_code"
+      condition: "agent starts and factory reads namespace config"
+      input_source_ids: [ctx.mcp_descriptions]
+      argument_sources: "path server_type and JSON config are stored by MCPServerConfigRepository; factory passes config to server factory and provider exposes discovered tool schemas"
+      validation_or_approval: "Pydantic config object and repository/server factory code"
+      execution_mode: "synchronous"
+      failure_behavior: "fallback"
+      related_l1_ids: [l1.admin.update_mcp, l1.admin.toggle_mcp, l1.admin.copilot_chat]
+      related_l2_ids: [l2.admin.mcp_config, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Actual namespace configuration was not read from the deployment}
+      source_ref: "finbot/apps/admin/routes/api.py; finbot/mcp/factory.py"
+
+  controls:
+    -
+      id: "control.session_context"
+      control_kind: "authorization"
+      applies_at: "other"
+      enforcement_mode: "modifying"
+      implementation: "code"
+      failure_mode: "unknown"
+      applies_to_agent_ids: [agent.vendor_chat, agent.finance_copilot, agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      related_l1_ids: [l1.auth.magic_link, l1.auth.verify, l1.vendor.chat, l1.admin.copilot_chat]
+      related_l2_ids: [l2.auth.session, l2.vendor.context, l2.vendor.chat, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/core/auth/middleware.py; finbot/core/auth/session.py"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Session middleware is installed globally; exact deployment settings not observed}
+    -
+      id: "control.csrf"
+      control_kind: "input_filter"
+      applies_at: "other"
+      enforcement_mode: "blocking"
+      implementation: "code"
+      failure_mode: "fail_closed"
+      applies_to_agent_ids: [agent.vendor_chat, agent.finance_copilot]
+      related_l1_ids: [l1.vendor.register, l1.vendor.chat, l1.admin.update_mcp, l1.admin.copilot_chat]
+      related_l2_ids: [l2.vendor.register, l2.vendor.chat, l2.admin.mcp_config, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/core/auth/csrf.py; finbot/static/js/common/api.js"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Protected methods require session token when CSRF setting is enabled}
+    -
+      id: "control.agent_hooks"
+      control_kind: "other"
+      applies_at: "before_tool"
+      enforcement_mode: "unknown"
+      implementation: "external_service"
+      failure_mode: "unknown"
+      applies_to_agent_ids: [agent.vendor_chat, agent.finance_copilot]
+      related_l1_ids: [l1.vendor.chat, l1.admin.copilot_chat]
+      related_l2_ids: [l2.vendor.chat, l2.admin.copilot]
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/guardrails/service.py; finbot/guardrails/schemas.py"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Chat calls before/after model and tool hooks; active endpoint/configuration and blocking behavior were not established}
+    -
+      id: "control.agent_retry"
+      control_kind: "other"
+      applies_at: "other"
+      enforcement_mode: "modifying"
+      implementation: "code"
+      failure_mode: "retry"
+      applies_to_agent_ids: [agent.orchestrator, agent.onboarding, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      related_l1_ids: [l1.vendor.register, l1.vendor.create_invoice, l1.vendor.reprocess_invoice]
+      related_l2_ids: [l2.vendor.register, l2.vendor.review, l2.vendor.invoices, l2.vendor.payments]
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/agents/runner.py"
+      visibility: "grey_box_required"
+      reachability: {status: source_confirmed, notes: Runner retries failed agent runs up to three times with exponential delays}
+    -
+      id: "control.mcp_enabled_state"
+      control_kind: "tool_policy"
+      applies_at: "before_model"
+      enforcement_mode: "blocking"
+      implementation: "platform_config"
+      failure_mode: "fail_closed"
+      applies_to_agent_ids: [agent.vendor_chat, agent.finance_copilot, agent.invoice, agent.fraud_compliance, agent.payments, agent.communication]
+      related_l1_ids: [l1.admin.toggle_mcp, l1.admin.update_mcp]
+      related_l2_ids: [l2.admin.mcp_config]
+      evidence_status: "source_confirmed"
+      source_ref: "finbot/mcp/factory.py; finbot/core/data/repositories.py"
+      visibility: "grey_box_required"
+      reachability: {status: unknown, notes: Factory returns no server when namespace config is disabled; deployment values were not observed}

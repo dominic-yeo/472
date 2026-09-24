@@ -54,7 +54,6 @@ fields:
       describes what happens to the value on that hop (e.g. renamed,
       validated, serialized, or unchanged).
 
-
   preconditions:
     status: modified
     type: list[string]
@@ -70,23 +69,6 @@ fields:
       What actually changes: DB rows created/updated/deleted, Redis event
       emitted, email sent, agent memory/context updated, tool description
       mutated.
-
-
-  observable_evidence:
-    status: modified
-    type: list[string]
-    desc: >
-      Black-box-visible signals that the effect occurred: UI state change,
-      HTTP response diff, WebSocket score/badge toast, an entry appearing
-      in the CTF Hacker Toolkit (Dead Drop / Exfil Data views), an email
-      visible in the console/dev inbox. Where the target environment has
-      its own automated success oracle (this repo's detector_class +
-      detector_config per challenge YAML, a WAF/SIEM alert, a test
-      assertion), record it as one more evidence entry here rather than as
-      a dedicated field — not every environment being annotated will have
-      one, and where it exists it's just a stronger-than-usual instance of
-      "evidence," not a different kind of fact.
-
 
   visibility:
     status: added
